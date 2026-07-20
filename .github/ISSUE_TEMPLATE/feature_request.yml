@@ -1,0 +1,33 @@
+name: Feature request
+description: Propose a focused addition that fits RETRACE's documented scope
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What concrete process-level failure or workflow is difficult today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed outcome
+      description: Describe the user-visible result without prescribing every implementation detail.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Example or evidence
+      description: Provide a synthetic example, expected CLI shape, or related technical reference.
+
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Scope and tradeoffs
+      description: Note privacy, security, portability, performance, or maintenance implications.
