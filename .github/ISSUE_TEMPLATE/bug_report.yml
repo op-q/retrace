@@ -1,0 +1,56 @@
+name: Bug report
+description: Report reproducible behavior that does not match the documentation
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: checkboxes
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed credentials, private paths, and sensitive process output.
+          required: true
+        - label: I searched existing issues for the same behavior.
+          required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: RETRACE version or revision
+      description: Use `retrace version` and, for development builds, the Git commit.
+      placeholder: 0.0.0-dev at commit abc1234
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the Linux distribution, architecture, and compiler if relevant.
+      placeholder: Ubuntu 24.04, x86-64, GCC 14
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use synthetic commands and data. Do not attach private traces or dumps.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Relevant diagnostics
+      description: Paste only the smallest redacted output needed to understand the problem.
+      render: text
