@@ -1,17 +1,32 @@
 # Security and privacy model
 
-RETRACE currently executes another program and returns its status. It does not
-yet create traces, capture streams, parse trace files, or inject a shared
-library. Those planned features handle sensitive and untrusted data, so their
-security properties are requirements—not claims about the current build.
+RETRACE currently executes another program, relays its stdout and stderr through
+bounded in-memory chunks, can persist selected run data to an explicit trace
+path, and can inspect or structurally validate v1.0 trace files. It does not yet
+inject a shared library. Runtime injection handles another sensitive boundary,
+so its security properties remain requirements—not claims about the current
+build.
 
 ## Current behavior
 
 - The current `run` command does not require root.
 - RETRACE launches only the command supplied after `run --` and waits for it.
-- The target currently inherits the invoking terminal and environment.
-- RETRACE does not currently record environment variables, file contents,
-  network payloads, stdout, or stderr.
+- The target inherits the invoking environment and standard input; its stdout
+  and stderr are redirected to RETRACE pipes.
+- RETRACE concurrently relays stdout and stderr without storing a complete copy.
+- `--output TRACE` records command arguments, working directory, lifecycle, and
+  stdout/stderr chunks. It does not record environment variables, file contents,
+  or network payloads.
+- A trace path requests mode `0600` (a restrictive umask may remove more
+  permissions) and uses close-on-exec, exclusive creation, and no final-component
+  symlink following. Existing paths are not overwritten, and the target is not
+  started if trace creation fails.
+- `inspect` and `validate` require a regular file. Their reader enforces the
+  1 MiB header and per-event payload limits before allocating, bounds the
+  argument count, checks every metadata field and frame, and reads events
+  incrementally.
+- `inspect` quotes untrusted byte fields, escapes control and non-printable
+  bytes, and caps displayed metadata, arguments, and event-payload previews.
 
 ## Required defaults for capture features
 
@@ -19,8 +34,6 @@ security properties are requirements—not claims about the current build.
 - Environment variables, file contents, and network payloads are not recorded
   by default.
 - Injected behavior is always labeled in the trace.
-- Trace files are created with user-only permissions by default.
-- Output paths are validated; unsafe symlink and overwrite behavior is avoided.
 - Readers treat trace files and event channels as untrusted input.
 
 Paths, command arguments, stdout, and stderr can still contain secrets. Review a
@@ -29,10 +42,17 @@ redaction, explicit environment allowlists, and disabling stream capture.
 
 ## Parser and runtime requirements
 
-Before trace support ships, trace and event parsers must validate lengths before
-allocating, cap payload and string sizes, check integer arithmetic, never assume
-NUL termination, and handle unknown or corrupt data without memory-unsafe
-behavior.
+The writer caps header and event payloads and uses explicit byte encodings. The
+reader validates lengths before allocating, uses checked cursor arithmetic,
+never assumes NUL termination, rejects malformed known-event payloads, and
+accepts otherwise valid unknown event identifiers as opaque bounded bytes.
+Malformed input fails cleanly, while an incomplete final frame is reported
+separately so preceding complete frames can still be inspected.
+
+These checks provide structural parsing, not trust or authenticity. Version 1.0
+has no footer, checksum, signature, or finalization record. A clean frame-boundary
+EOF therefore cannot prove that the original writer finished, that a suffix was
+not lost, that bytes were not modified, or that data is safe to disclose.
 
 Before runtime injection ships, the injected runtime must preserve `errno`,
 prevent recursion, minimize allocation and locking inside hooks, and normally

@@ -137,7 +137,8 @@ pipe automatically; a failed call writes its saved `errno`. This distinguishes
 ## Lesson 8: C streams and a test fixture
 
 `tests/fixtures/stream_fixture.c` is the first compiled C source in the project.
-It writes deterministic markers through C's standard I/O API:
+It writes deterministic markers and larger test streams through C's standard
+I/O API:
 
 ```c
 fputs("fixture: stdout\n", stdout);
@@ -150,14 +151,77 @@ descriptors. Each call returns a status that C code must check explicitly.
 process.
 
 `fflush()` matters because a C library may buffer output, especially when a
-stream points to a pipe instead of an interactive terminal. Even with explicit
-flushes, a collector reading two different descriptors must not assume their
-display order perfectly reconstructs execution order. RETRACE will read both
-concurrently and timestamp chunks when stream capture is implemented.
+stream points to a pipe instead of an interactive terminal. RETRACE redirects
+both descriptors with `dup2()` and uses `poll()` to read whichever pipe becomes
+ready. It rotates which pipe is considered first between polling cycles so a
+busy stream cannot starve the other. A fixed-size buffer sends each chunk to a
+callback immediately, keeping supervisor memory bounded and leaving a natural
+hook for the trace writer.
 
-In C, `int main(void)` explicitly declares that the program accepts no
-arguments. This is preferable to an empty parameter list, whose historical C
-meaning differs from C++.
+Even with concurrent reads, a collector must not claim perfect ordering between
+two independent pipes. If both are ready before the parent runs, the kernel does
+not preserve a single cross-pipe write order for it to recover. Future trace
+events can timestamp observed chunks, but those timestamps describe collection
+order rather than exact instruction order in the target.
+
+The collector also checks `waitpid(..., WNOHANG)` while polling. After the direct
+child exits, a grandchild may still own copies of the stream write ends. Linux
+`FIONREAD` lets RETRACE snapshot the bytes already queued; it drains exactly that
+bounded amount and closes the read ends instead of waiting forever for unrelated
+descriptor owners.
+
+In C, `int main(void)` explicitly declares that a program accepts no arguments.
+The expanded fixture instead uses `int main(int argc, char* argv[])` so a test
+mode can be selected. Both forms are preferable to an empty parameter list,
+whose historical C meaning differs from C++.
+
+## Lesson 9: framing bytes for a durable trace
+
+The trace writer does not write an in-memory C++ struct directly. Struct padding,
+native byte order, and type sizes can differ between compilers and machines.
+Instead, small encoding functions place each unsigned integer into a byte array
+in little-endian order. Strings are stored as a 32-bit byte count followed by
+exactly that many bytes, so embedded NUL bytes do not terminate a field.
+
+Each event starts with its total framed length. If RETRACE stops midway through
+the final write, a reader can scan the earlier complete lengths and stop at the
+incomplete tail. This is crash-tolerant framing, not a guarantee against storage
+loss during a machine or filesystem failure.
+
+The move-only `trace::Writer` is another RAII owner: its destructor closes the
+trace descriptor. Creation uses Linux flags that reject existing paths and avoid
+following a final symlink, and requests mode `0600` so access is limited to the
+creating user. A restrictive umask can remove more permissions. The trace
+descriptor is close-on-exec so the target cannot accidentally inherit it.
+
+## Lesson 10: bounded parsing and explicit outcomes
+
+A file parser must distrust lengths stored in the file itself. RETRACE's reader
+first reads the fixed 16-byte prefix, rejects unsupported versions and headers
+larger than 1 MiB, and only then allocates the header payload. A small cursor
+checks its remaining byte count before decoding every integer or byte string.
+The same pattern applies to each event: validate its declared frame size before
+allocating, then verify the redundant payload size, flags, timestamp order, and
+known payload shape.
+
+This is also an ownership lesson. `trace::Header` and `trace::Event` contain
+owned `std::string` and `std::vector` values rather than views into a reusable
+read buffer. A caller can safely retain a decoded value in separate storage
+after the next read. The move-only `trace::Reader` owns its descriptor through
+the same RAII pattern as the writer.
+
+Parsing has more than two outcomes. `Reader::next()` distinguishes a decoded
+event, clean end of input, an incomplete final frame, and an error. Format errors
+use a custom `std::error_category`, while operating-system failures retain their
+system category. This lets the CLI map malformed, unsupported, and truncated
+traces to code `4` without mislabeling a missing file as bad trace data.
+
+Unknown event identifiers illustrate forward-compatible framing: when their
+lengths, flags, and timestamp are valid, the reader preserves their payload as
+opaque bytes instead of guessing its meaning. The inspector escapes and caps
+those bytes before printing them. Finally, clean EOF means only that the parsed
+bytes end on a frame boundary. With no v1.0 footer or checksum, it cannot prove
+that the recording was finalized or authenticated.
 
 ## Habits to practice now
 

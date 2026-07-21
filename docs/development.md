@@ -15,10 +15,11 @@ scripts/               local formatting, testing, and safety checks
 .github/               CI and collaboration templates
 ```
 
-As features land, `src/` will split into CLI, process, trace, and fault
-components. `runtime/` will contain the C shared library only when milestone
-v0.2 begins. `examples/`, `scenarios/`, and integration fixtures should be added
-with the behavior they demonstrate rather than as empty directories.
+`src/` is split into CLI, process, and trace components; a fault component will
+be added with that milestone. `runtime/` will contain the C shared library only
+when milestone v0.2 begins. `examples/`, `scenarios/`, and integration fixtures
+should be added with the behavior they demonstrate rather than as empty
+directories.
 
 ## Technology choices
 
@@ -27,7 +28,8 @@ with the behavior they demonstrate rather than as empty directories.
 - Production code uses C++20; the injected runtime uses C17.
 - The initial CLI parser and test harness are deliberately dependency-free.
 - TOML is the planned scenario format.
-- Trace framing will be implemented directly while the event model is small.
+- Trace framing and parsing are implemented directly while the event model is
+  small.
 - clang-format, clang-tidy, compiler warnings, and sanitizers provide overlapping
   quality checks.
 
@@ -53,8 +55,17 @@ remain separate from captured target output.
 
 ## Testing policy
 
-The current tests cover CLI behavior, file-descriptor ownership, process launch
-and exit handling, and execution of a deterministic C stream fixture.
+The current tests cover CLI behavior, file-descriptor and pipe ownership,
+process launch and lifecycle events, separate stdout/stderr routing, concurrent
+collection of output larger than a pipe's capacity, trace metadata and framing,
+exclusive user-only file creation, CLI recording, and recovery of complete
+frames before a truncated tail. Reader tests use independently encoded bytes to
+exercise header and frame bounds, unsupported versions, known payload schemas,
+nondecreasing timestamps, unknown event identifiers, and every truncation point
+across representative frames. CLI tests cover inspection, structural
+validation, escaped output, failed output streams, and their usage, I/O, and
+trace-format exit codes. Process tests also verify that a descendant retaining
+inherited stream descriptors cannot hold the direct target's capture open.
 
 As features land, unit tests will cover duration, signal, and rule parsing; path
 matching; encoding and decoding; format bounds; rendering; and corrupt payloads.
@@ -64,8 +75,10 @@ partial traces. Runtime tests will cover symbol resolution, recursion guards,
 `errno`, threads, unavailable channels, payload bounds, long paths, partial
 writes, and activation counts.
 
-Once traces exist, golden tests will protect reader compatibility, validation,
-timeline and JSON output, truncation recovery, and unknown future events.
+Reader and writer compatibility tests protect the v1.0 byte order, metadata
+layout, frame layout, bounds, truncation boundary, corrupt-input handling, and
+unknown future events. Timeline tests protect the current terminal rendering.
+JSON output remains planned.
 
 AddressSanitizer and UndefinedBehaviorSanitizer run together in CI. Static
 analysis and formatting also run in CI. ThreadSanitizer will be introduced where

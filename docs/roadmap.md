@@ -13,14 +13,14 @@ the main implementation until current acceptance criteria are met.
 
 ## v0.1 progress — process execution
 
-- [x] Add a move-only RAII file-descriptor owner.
+- [x] Add move-only RAII file-descriptor and pipe owners.
 - [x] Launch a command with `fork()` and `execvp()`.
 - [x] Preserve target arguments.
 - [x] Distinguish an `exec` failure from target exit code 127.
 - [x] Preserve ordinary exit codes and terminating signals.
-- [ ] Capture stdout and stderr with pipes.
-- [ ] Create a versioned trace and lifecycle events.
-- [ ] Inspect and validate traces.
+- [x] Capture stdout and stderr with pipes.
+- [x] Create a versioned trace and lifecycle events.
+- [x] Inspect and validate traces.
 - [ ] Create a process group and forward signals.
 
 ## v0.1 — process recorder
