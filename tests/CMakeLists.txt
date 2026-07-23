@@ -32,6 +32,20 @@ retrace_set_project_warnings(retrace_signal_fixture)
 retrace_enable_sanitizers(retrace_signal_fixture "${RETRACE_SANITIZER}")
 add_dependencies(retrace_cli_test retrace_signal_fixture)
 
+add_executable(retrace_runtime_test runtime/runtime_test.c)
+target_include_directories(
+  retrace_runtime_test
+  PRIVATE "${PROJECT_SOURCE_DIR}/include"
+)
+target_compile_definitions(
+  retrace_runtime_test
+  PRIVATE RETRACE_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:retrace_runtime>"
+)
+target_link_libraries(retrace_runtime_test PRIVATE "${CMAKE_DL_LIBS}")
+retrace_set_project_warnings(retrace_runtime_test)
+retrace_enable_sanitizers(retrace_runtime_test "${RETRACE_SANITIZER}")
+add_dependencies(retrace_runtime_test retrace_runtime)
+
 add_executable(retrace_process_test integration/process_test.cpp)
 target_link_libraries(retrace_process_test PRIVATE retrace::core)
 target_compile_definitions(
@@ -45,6 +59,7 @@ retrace_set_project_warnings(retrace_process_test)
 retrace_enable_sanitizers(retrace_process_test "${RETRACE_SANITIZER}")
 
 add_test(NAME process.integration COMMAND retrace_process_test)
+add_test(NAME runtime.handshake COMMAND retrace_runtime_test)
 
 add_test(NAME cli.version COMMAND retrace version)
 set_tests_properties(

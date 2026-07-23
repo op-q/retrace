@@ -55,8 +55,9 @@ Recorded traces can be inspected or structurally validated:
 ./build/dev/bin/retrace validate /tmp/example.rtc
 ```
 
-The v0.1 process-recorder slice is implemented. The next work is release
-hardening; the injected runtime remains deferred to v0.2.
+The v0.1 process-recorder slice is implemented. Development has begun on the
+v0.2 injected runtime with a standalone C17 library and versioned handshake;
+`retrace run` does not load or consume that runtime yet.
 
 Later releases will add a small C runtime loaded with `LD_PRELOAD` so selected
 libc operations can be observed and controlled:

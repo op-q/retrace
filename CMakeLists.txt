@@ -69,6 +69,7 @@ target_link_libraries(retrace PRIVATE retrace::core)
 retrace_set_project_warnings(retrace)
 retrace_enable_sanitizers(retrace "${RETRACE_SANITIZER}")
 
+add_subdirectory(runtime)
 add_subdirectory(examples)
 
 if(BUILD_TESTING)
@@ -76,3 +77,7 @@ if(BUILD_TESTING)
 endif()
 
 install(TARGETS retrace RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+install(
+  FILES include/retrace/runtime_protocol.h
+  DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/retrace"
+)

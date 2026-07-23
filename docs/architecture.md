@@ -75,8 +75,13 @@ tracking remain later work. Linux subreaper behavior may be evaluated later.
 
 ### Injected runtime
 
-Planned for v0.2, a deliberately small C shared library will be loaded into
-dynamically linked targets through `LD_PRELOAD`. It will:
+The first v0.2 slice builds a deliberately small C shared library. Its
+constructor can emit a versioned handshake over an explicitly configured
+Unix-domain sequenced-packet socket. Missing, malformed, or closed channels are
+nonfatal. The supervisor does not load the library yet.
+
+The completed runtime will be loaded into dynamically linked targets through
+`LD_PRELOAD`. It will:
 
 - interpose selected libc calls;
 - resolve the real symbol with `dlsym(RTLD_NEXT, ...)`;
@@ -88,6 +93,9 @@ dynamically linked targets through `LD_PRELOAD`. It will:
 
 It cannot reliably instrument static binaries, setuid binaries, direct syscalls,
 or every language runtime. RETRACE must report these limits honestly.
+
+The [runtime event protocol](runtime-protocol.md) is a separate live contract
+from the on-disk trace format.
 
 ### Trace reader and writer
 

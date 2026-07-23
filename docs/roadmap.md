@@ -80,6 +80,15 @@ multi-threaded fixtures, bounded payloads, and graceful behavior when the event
 channel is absent. Unsupported static/setuid targets are reported rather than
 silently misrepresented.
 
+Initial progress:
+
+- [x] Build a C17 `libretrace_runtime.so`.
+- [x] Define and emit a versioned, bounded handshake frame.
+- [x] Keep absent, invalid, and closed event channels nonfatal.
+- [ ] Create and validate the runtime channel in the supervisor.
+- [ ] Load the runtime into supported dynamic targets.
+- [ ] Interpose and record the selected libc operations.
+
 ## v0.3 — fault injection
 
 Add failed matching file opens, delayed matching connections, scheduled signals

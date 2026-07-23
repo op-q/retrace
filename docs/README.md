@@ -25,6 +25,7 @@ Read these in order when learning the project:
 | Document | Purpose |
 | --- | --- |
 | [Trace format](trace-format.md) | The versioned on-disk contract, event schemas, bounds, and reader behavior |
+| [Runtime protocol](runtime-protocol.md) | The live C-runtime handshake and event-channel framing contract |
 | [Security model](security.md) | Process, filesystem, parser, trace-data, and repository safety boundaries |
 | [Fault rules](fault-rules.md) | Planned scenario language and fault evidence requirements |
 | [C and C++ learning guide](learning-c-and-cpp.md) | Explanations of the native concepts used by the implementation |
