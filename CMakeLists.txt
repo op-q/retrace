@@ -46,7 +46,10 @@ configure_file(
 add_library(
   retrace_core STATIC
   src/cli/commands.cpp
+  src/cli/trace_commands.cpp
   src/process/process.cpp
+  src/trace/reader.cpp
+  src/trace/writer.cpp
 )
 add_library(retrace::core ALIAS retrace_core)
 
@@ -65,6 +68,8 @@ add_executable(retrace src/main.cpp)
 target_link_libraries(retrace PRIVATE retrace::core)
 retrace_set_project_warnings(retrace)
 retrace_enable_sanitizers(retrace "${RETRACE_SANITIZER}")
+
+add_subdirectory(examples)
 
 if(BUILD_TESTING)
   add_subdirectory(tests)

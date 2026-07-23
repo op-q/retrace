@@ -15,10 +15,9 @@ C++ builds on C's systems capabilities with constructors, destructors,
 templates, containers, stronger types, and RAII. It is a good fit for the main
 program because RETRACE will own many resources and coordinate complex states.
 
-The root CMake project enables both `C17` and `C++20`. No production C source is
-added yet: the roadmap deliberately finishes process recording before injecting
-code into a target. A small C fixture under `tests/` already exercises the C
-toolchain and produces deterministic stdout and stderr.
+The root CMake project enables both `C17` and `C++20`. Small C fixtures under
+`tests/` and recorder demonstrations under `examples/` exercise the C toolchain.
+The injected C runtime remains deferred until the process recorder is complete.
 
 ## Lesson 2: compilation and linking
 
@@ -137,7 +136,8 @@ pipe automatically; a failed call writes its saved `errno`. This distinguishes
 ## Lesson 8: C streams and a test fixture
 
 `tests/fixtures/stream_fixture.c` is the first compiled C source in the project.
-It writes deterministic markers through C's standard I/O API:
+It writes deterministic markers and larger test streams through C's standard
+I/O API:
 
 ```c
 fputs("fixture: stdout\n", stdout);
@@ -150,14 +150,107 @@ descriptors. Each call returns a status that C code must check explicitly.
 process.
 
 `fflush()` matters because a C library may buffer output, especially when a
-stream points to a pipe instead of an interactive terminal. Even with explicit
-flushes, a collector reading two different descriptors must not assume their
-display order perfectly reconstructs execution order. RETRACE will read both
-concurrently and timestamp chunks when stream capture is implemented.
+stream points to a pipe instead of an interactive terminal. RETRACE redirects
+both descriptors with `dup2()` and uses `poll()` to read whichever pipe becomes
+ready. It rotates which pipe is considered first between polling cycles so a
+busy stream cannot starve the other. A fixed-size buffer sends each chunk to a
+callback immediately, keeping supervisor memory bounded and leaving a natural
+hook for the trace writer.
 
-In C, `int main(void)` explicitly declares that the program accepts no
-arguments. This is preferable to an empty parameter list, whose historical C
-meaning differs from C++.
+Even with concurrent reads, a collector must not claim perfect ordering between
+two independent pipes. If both are ready before the parent runs, the kernel does
+not preserve a single cross-pipe write order for it to recover. Future trace
+events can timestamp observed chunks, but those timestamps describe collection
+order rather than exact instruction order in the target.
+
+The collector also checks `waitpid(..., WNOHANG)` while polling. After the direct
+child exits, a grandchild may still own copies of the stream write ends. Linux
+`FIONREAD` lets RETRACE snapshot the bytes already queued; it drains exactly that
+bounded amount and closes the read ends instead of waiting forever for unrelated
+descriptor owners.
+
+In C, `int main(void)` explicitly declares that a program accepts no arguments.
+The expanded fixture instead uses `int main(int argc, char* argv[])` so a test
+mode can be selected. Both forms are preferable to an empty parameter list,
+whose historical C meaning differs from C++.
+
+## Lesson 9: framing bytes for a durable trace
+
+The trace writer does not write an in-memory C++ struct directly. Struct padding,
+native byte order, and type sizes can differ between compilers and machines.
+Instead, small encoding functions place each unsigned integer into a byte array
+in little-endian order. Strings are stored as a 32-bit byte count followed by
+exactly that many bytes, so embedded NUL bytes do not terminate a field.
+
+Each event starts with its total framed length. If RETRACE stops midway through
+the final write, a reader can scan the earlier complete lengths and stop at the
+incomplete tail. This is crash-tolerant framing, not a guarantee against storage
+loss during a machine or filesystem failure.
+
+The move-only `trace::Writer` is another RAII owner: its destructor closes the
+trace descriptor. Creation uses Linux flags that reject existing paths and avoid
+following a final symlink, and requests mode `0600` so access is limited to the
+creating user. A restrictive umask can remove more permissions. The trace
+descriptor is close-on-exec so the target cannot accidentally inherit it.
+
+## Lesson 10: bounded parsing and explicit outcomes
+
+A file parser must distrust lengths stored in the file itself. RETRACE's reader
+first reads the fixed 16-byte prefix, rejects unsupported versions and headers
+larger than 1 MiB, and only then allocates the header payload. A small cursor
+checks its remaining byte count before decoding every integer or byte string.
+The same pattern applies to each event: validate its declared frame size before
+allocating, then verify the redundant payload size, flags, timestamp order, and
+known payload shape.
+
+This is also an ownership lesson. `trace::Header` and `trace::Event` contain
+owned `std::string` and `std::vector` values rather than views into a reusable
+read buffer. A caller can safely retain a decoded value in separate storage
+after the next read. The move-only `trace::Reader` owns its descriptor through
+the same RAII pattern as the writer.
+
+Parsing has more than two outcomes. `Reader::next()` distinguishes a decoded
+event, clean end of input, an incomplete final frame, and an error. Format errors
+use a custom `std::error_category`, while operating-system failures retain their
+system category. This lets the CLI map malformed, unsupported, and truncated
+traces to code `4` without mislabeling a missing file as bad trace data.
+
+Unknown event identifiers illustrate forward-compatible framing: when their
+lengths, flags, and timestamp are valid, the reader preserves their payload as
+opaque bytes instead of guessing its meaning. The inspector escapes and caps
+those bytes before printing them. Finally, clean EOF means only that the parsed
+bytes end on a frame boundary. With no v1.0 footer or checksum, it cannot prove
+that the recording was finalized or authenticated.
+
+## Lesson 11: process groups, signals, and `chdir`
+
+A process group gives one identifier to a related set of processes. The target
+child calls `setpgid(0, 0)` before `execvp()`, making its PID the group ID.
+RETRACE can then send a signal to the whole group with a negative identifier:
+
+```c
+kill(-target_process_group, SIGTERM);
+```
+
+This reaches descendants that remain in the group, unlike `kill(target_pid,
+SIGTERM)`, which addresses only the leader. RETRACE blocks `SIGINT` and `SIGTERM`
+around `fork()` and receives them through Linux `signalfd`. Because that
+descriptor participates in `poll()` beside stdout and stderr, ordinary C++ code
+can forward and record signals without running containers, streams, or callbacks
+inside an asynchronous signal handler. The child restores the caller's original
+signal mask before replacing its process image, and the parent restores it when
+supervision ends.
+
+The selected working directory follows a similar pre-`exec` rule. The CLI first
+resolves and validates the directory so a bad path cannot create a misleading
+trace. The child still calls `chdir()` and reports its saved `errno` through the
+launch-status pipe because the filesystem may change between validation and use.
+This repeated check handles the time-of-check/time-of-use boundary honestly.
+
+The C examples show two explicit outcome paths. `normal.c` checks each stream
+operation and returns `EXIT_SUCCESS`; `crash.c` calls `raise(SIGSEGV)` so the
+recorder observes deliberate signal termination without relying on undefined
+behavior.
 
 ## Habits to practice now
 

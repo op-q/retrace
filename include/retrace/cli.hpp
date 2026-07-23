@@ -11,6 +11,7 @@ enum class ExitCode : std::uint8_t {
   success = 0,
   internal_error = 1,
   usage_error = 2,
+  trace_format_error = 4,
   target_launch_error = 5,
 };
 

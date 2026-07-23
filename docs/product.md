@@ -56,13 +56,19 @@ some of them only after the core recorder is finished.
 
 ## Core use cases
 
-The planned workflow is:
+The implemented workflow covers the first two steps, the inspect/validate parts
+of step three, and user-sent `SIGINT`/`SIGTERM` in step four. Filtering, export,
+time limits, and scenario-driven signals remain planned:
 
 1. Run a command and preserve its arguments.
 2. Capture lifecycle metadata and configured streams.
 3. Inspect, filter, validate, or export its trace.
 4. Add a time limit, signal, or reusable fault scenario.
 5. Compare normal and failing behavior without calling that deterministic replay.
+
+Inspection renders a readable terminal timeline and validation checks the v1.0
+binary structure. Neither operation authenticates trace contents or proves that
+a frame-aligned recording was finalized; v1.0 has no footer or checksum.
 
 See [cli.md](cli.md) for the command shapes and [fault-rules.md](fault-rules.md)
 for scenarios.

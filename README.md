@@ -11,15 +11,29 @@ failure conditions deliberately.
 
 ## Status
 
-RETRACE is pre-alpha but has a working process-execution slice:
+RETRACE is pre-alpha but has a working process-recording and inspection slice:
 
 - `retrace run` launches a command and preserves its arguments;
+- `run --working-directory PATH` selects and records the target directory;
+- each target leads a process group, and received `SIGINT`/`SIGTERM` signals are
+  forwarded to that group and recorded;
 - normal exits and signal termination are returned to the caller;
-- launch failure is distinguished from a target that exits with status 127; and
-- dependency-free tests exercise the CLI, process layer, and a C stream fixture.
+- launch failure is distinguished from a target that exits with status 127;
+- stdout and stderr are collected concurrently through separate pipes and
+  forwarded to the caller;
+- `run --output TRACE` writes an exclusive, user-only v1.0 trace containing
+  command metadata, lifecycle events, and captured stream chunks;
+- `retrace inspect TRACE` renders a bounded, escaped timeline, including valid
+  unknown event types;
+- `retrace validate TRACE` checks the v1.0 structure without loading the whole
+  event stream into memory; and
+- dependency-free tests exercise the CLI, process and trace layers, and a C
+  stream fixture.
 
-The target currently inherits the terminal's stdout and stderr. Trace writing,
-stream capture, process groups, and signal forwarding are not implemented yet.
+Time limits, trace export, runtime instrumentation, and fault injection are not
+implemented yet. A successful validation means that the bytes are structurally
+valid v1.0; because v1.0 has no footer or checksum, it does not prove that a run
+was finalized or that its contents are authentic.
 
 RETRACE is open source under the [MIT License](LICENSE).
 
@@ -30,15 +44,19 @@ The current runner can execute a target:
 ```bash
 ./build/dev/bin/retrace run -- /bin/echo "hello from RETRACE"
 ./build/dev/bin/retrace run -- python3 -c 'print("hello from Python")'
+./build/dev/bin/retrace run --output /tmp/example.rtc -- /bin/echo recorded
+./build/dev/bin/retrace run --working-directory /tmp -- /bin/pwd
 ```
 
-The rest of v0.1 will record lifecycle and output, write a crash-tolerant trace,
-and render a readable timeline:
+Recorded traces can be inspected or structurally validated:
 
 ```bash
-# Planned for v0.1; not implemented yet.
-retrace inspect .retrace/traces/latest.rtc
+./build/dev/bin/retrace inspect /tmp/example.rtc
+./build/dev/bin/retrace validate /tmp/example.rtc
 ```
+
+The v0.1 process-recorder slice is implemented. The next work is release
+hardening; the injected runtime remains deferred to v0.2.
 
 Later releases will add a small C runtime loaded with `LD_PRELOAD` so selected
 libc operations can be observed and controlled:
@@ -77,23 +95,26 @@ No third-party runtime or test dependencies are used at this stage.
 
 ## Documentation
 
+- [Documentation map](docs/README.md)
 - [Architecture](docs/architecture.md)
 - [Product goals and scope](docs/product.md)
 - [Development design](docs/development.md)
 - [CLI design](docs/cli.md)
 - [Trace format](docs/trace-format.md)
+- [Recorder examples](docs/examples.md)
 - [Fault rules](docs/fault-rules.md)
 - [Security model](docs/security.md)
 - [Roadmap](docs/roadmap.md)
+- [v0.1 release checklist](docs/release-checklist.md)
 - [C and C++ learning guide](docs/learning-c-and-cpp.md)
 - [Contributing](CONTRIBUTING.md)
 
 ## Safety warning
 
-Future trace data may contain command arguments, paths, standard output, and
-standard error. Any of those can contain secrets. Capture features must minimize
-collection by default, but users will still need to review traces before sharing
-them. See [docs/security.md](docs/security.md) for the full safety model.
+Trace data may contain command arguments, paths, standard output, and standard
+error. Any of those can contain secrets. Recording currently requires an
+explicit `--output` path; review every trace before sharing it. See
+[docs/security.md](docs/security.md) for the full safety model.
 
 ## Scope
 

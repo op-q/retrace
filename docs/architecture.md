@@ -2,10 +2,13 @@
 
 ## Product boundary
 
-Today, RETRACE launches one command, waits for it, and returns its exit status.
-The target inherits the terminal's stdout and stderr. Trace writing, stream
-capture, process groups, signal forwarding, and fault injection are not yet
-implemented.
+Today, RETRACE launches one command, collects its stdout and stderr concurrently,
+forwards both streams, selects a target working directory, and can write command
+metadata and observed lifecycle and stream events to a versioned trace. Each
+target leads a process group; RETRACE synchronously receives `SIGINT` and
+`SIGTERM`, forwards them to that group, and records successful forwarding. It can
+also validate a trace's v1.0 structure and render its complete events as a
+terminal timeline. Trace export and fault injection are not yet implemented.
 
 The target architecture will supervise the command, record selected runtime
 events, and write them to a trace. Later it will reproduce explicitly configured
@@ -30,33 +33,45 @@ Trace file
 
 ### CLI
 
-The current CLI parses `help`, `version`, and `run`, validates their arguments,
-and returns documented exit codes. Scenario loading and output selection will
-be added with their corresponding features. The public interface should remain
-stable even while internals evolve.
+The current CLI parses `help`, `version`, `run`, `inspect`, and `validate`,
+including an explicit `run --output TRACE` recording path. It validates command
+arguments and returns documented exit codes. Scenario loading, export, filters,
+and further output selection will be added with their corresponding features.
+The public interface should remain stable even while internals evolve.
 
 ### Supervisor
 
-The current C++ process layer owns command launch and waiting. It distinguishes
-a launch failure from a target that exits with status 127 and preserves normal
-exit and signal status. The planned supervisor will also own pipes, process
-groups, signal forwarding, stream collection, runtime-event collection, and
-trace finalization. It must state whether a usable partial trace exists.
+The current C++ process layer owns command launch, the target process group,
+close-on-exec pipes, synchronous signal forwarding, concurrent stream
+collection, typed lifecycle events, and waiting. It distinguishes a launch
+failure from a target that exits with status 127 and preserves normal exit and
+signal status. A bounded buffer feeds events to a callback instead of
+accumulating all target output in memory. The planned supervisor will also own
+runtime-event collection. It must state whether a usable partial trace exists.
 
-The planned launch sequence is:
+Child status is checked while the stream pipes are polled. Once the direct child
+is reaped, the collector snapshots and drains only bytes already queued in each
+pipe, then closes its read ends. This preserves buffered direct-child output
+without allowing a descendant that inherited a write end to extend collection
+forever. Descendants share the target process group for signal delivery, but
+RETRACE still waits for and reports only the direct target.
 
-1. Parse the command and scenario.
-2. Create the trace and stdout, stderr, and event pipes.
+The current launch sequence is:
+
+1. Parse the command and validate the selected working directory.
+2. Create the trace, stdout/stderr pipes, launch-status pipe, and signal source.
 3. Call `fork()`.
-4. In the child, create the target process group, redirect descriptors,
-   configure the runtime environment, and call `execve()`.
-5. In the parent, close unused pipe ends, record `process.start`, collect
-   events, forward signals, and wait with `waitpid()`.
-6. Flush all complete frames and finalize the trace.
+4. In the child, create the target process group, restore the inherited signal
+   mask, change directory, redirect descriptors, and call `execvp()`.
+5. In the parent, close unused pipe ends, record `process.start`, poll streams
+   and the signal source, forward signals with `kill(-pgid, signal)`, and check
+   completion with `waitpid()`.
+6. Finish all complete frame writes and close the trace. Version 1.0 has no
+   footer or durable-finalization record.
 
-Child-process support will grow in phases: supervise the original target first,
-then report `fork`/`exec`, then track descendants in the process group. Linux
-subreaper behavior may be evaluated later.
+Child-process support will grow in phases. The original target is supervised and
+descendants receive group-directed signals, but descendant discovery and event
+tracking remain later work. Linux subreaper behavior may be evaluated later.
 
 ### Injected runtime
 
@@ -76,10 +91,29 @@ or every language runtime. RETRACE must report these limits honestly.
 
 ### Trace reader and writer
 
-This component is planned, not implemented. Trace persistence will remain
-independent from live process supervision. Writers will append frames without
-holding the entire trace in memory. Readers will treat every file as untrusted
-and recover complete preceding frames when the end is truncated.
+The v1.0 writer and reader are implemented independently from live process
+supervision. The writer creates a new user-only file, appends bounded frames
+without holding the entire trace in memory, and stops after a write failure so
+an incomplete frame remains the final frame.
+
+The CLI explicitly finishes an open writer and checks the final `close(2)`
+result before reporting recording success. It does not claim `fsync(2)`-level
+durability, and writer calls must remain serialized so frame writes cannot
+interleave.
+
+The move-only reader owns its descriptor and decoded header. It validates the
+fixed prefix and supported version, applies size limits before allocating,
+decodes metadata through a checked cursor, and reads one owned event at a time.
+Known event payloads and nondecreasing timestamps are checked; otherwise valid
+unknown event identifiers remain readable for forward extension. End of input,
+an incomplete final frame, malformed input, and operating-system read errors are
+distinct outcomes.
+
+The validator consumes this stream without rendering it. The inspector renders
+the same complete prefix with bounded, escaped byte previews. A clean end is
+reported as structurally valid, but v1.0 has no footer or checksum: it cannot
+prove that the writer finalized the run, that a frame-aligned suffix was not
+lost, or that the bytes are authentic.
 
 ### Fault engine
 
@@ -90,11 +124,11 @@ explainable and reproducible within its documented limits.
 
 ## C and C++ responsibilities
 
-C++20 is used for the current CLI, process execution, tests, and file-descriptor
-ownership. It will also implement supervision, trace I/O, scenario parsing,
-rendering, and concurrency. C++ RAII types will own resources such as pipes,
-processes, threads, mappings, trace files, temporary directories, and restored
-signal masks as those features arrive.
+C++20 is used for the current CLI, process execution, trace I/O and rendering,
+tests, and file-descriptor ownership. It will also implement broader
+supervision, scenario parsing, and concurrency. C++ RAII types own current pipes
+and trace descriptors and will own processes, threads, mappings, temporary
+directories, and restored signal masks as those features arrive.
 
 C17 is used for the injected runtime because it crosses a C ABI and runs inside
 someone else's process. Keeping that code small avoids pulling the C++ runtime,
