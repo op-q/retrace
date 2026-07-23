@@ -85,17 +85,22 @@ global flag.
 ## Tests
 
 The current suite uses small, dependency-free C++ test executables registered
-with CTest. It covers CLI behavior, file-descriptor ownership, process launch
-and exit handling, and execution of a compiled C stream fixture. As the suite
-grows, a test framework may be introduced deliberately.
+with CTest. It covers CLI behavior, file-descriptor and pipe ownership, process
+launch and exit handling, working directories, process groups, signal
+forwarding, bounded stream collection, trace writing and compatibility,
+streaming inspection and validation, malformed and incomplete traces, and
+normal and intentional-crash C examples.
 
-Planned unit tests will cover parsing, encoding, matching, and rendering.
-Planned golden tests will protect trace compatibility and output once the trace
-format exists. Sanitizers and static analysis complement the current functional
+Future tests will cover runtime symbol interposition, recursion guards,
+`errno`, threads, event transport, fault-rule parsing and matching, and injected
+failure evidence. Sanitizers and static analysis complement the functional
 tests.
 
 Every behavior change should include a test at the lowest useful layer. Error
 paths matter as much as successful paths in a tracing tool.
+
+Before preparing a release, complete
+[the v0.1 release checklist](docs/release-checklist.md).
 
 ## Pull requests
 

@@ -56,8 +56,9 @@ some of them only after the core recorder is finished.
 
 ## Core use cases
 
-The implemented workflow covers the first two steps and the inspect/validate
-parts of step three. Filtering and export remain planned:
+The implemented workflow covers the first two steps, the inspect/validate parts
+of step three, and user-sent `SIGINT`/`SIGTERM` in step four. Filtering, export,
+time limits, and scenario-driven signals remain planned:
 
 1. Run a command and preserve its arguments.
 2. Capture lifecycle metadata and configured streams.

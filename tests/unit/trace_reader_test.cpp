@@ -356,6 +356,16 @@ void test_distinguishes_truncation_and_malformed_frames(TestContext& test) {
                                               retrace::trace::TraceErrc::invalid_event),
               "known event payload shapes are enforced");
 
+  auto bad_signal_payload = golden_header();
+  append_frame(bad_signal_payload,
+               static_cast<std::uint16_t>(retrace::trace::EventType::signal_receive),
+               1U, {});
+  test.expect(!open_bytes(bad_signal_payload, reader),
+              "a bad signal-receive trace opens");
+  test.expect(reader.next(event).error == retrace::trace::make_error_code(
+                                              retrace::trace::TraceErrc::invalid_event),
+              "signal-receive requires a u32 payload");
+
   auto partial_payload = golden_header();
   append_frame(partial_payload, 60000U, 1U, {1U, 2U});
   partial_payload.pop_back();

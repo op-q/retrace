@@ -15,10 +15,9 @@ C++ builds on C's systems capabilities with constructors, destructors,
 templates, containers, stronger types, and RAII. It is a good fit for the main
 program because RETRACE will own many resources and coordinate complex states.
 
-The root CMake project enables both `C17` and `C++20`. No production C source is
-added yet: the roadmap deliberately finishes process recording before injecting
-code into a target. A small C fixture under `tests/` already exercises the C
-toolchain and produces deterministic stdout and stderr.
+The root CMake project enables both `C17` and `C++20`. Small C fixtures under
+`tests/` and recorder demonstrations under `examples/` exercise the C toolchain.
+The injected C runtime remains deferred until the process recorder is complete.
 
 ## Lesson 2: compilation and linking
 
@@ -222,6 +221,36 @@ opaque bytes instead of guessing its meaning. The inspector escapes and caps
 those bytes before printing them. Finally, clean EOF means only that the parsed
 bytes end on a frame boundary. With no v1.0 footer or checksum, it cannot prove
 that the recording was finalized or authenticated.
+
+## Lesson 11: process groups, signals, and `chdir`
+
+A process group gives one identifier to a related set of processes. The target
+child calls `setpgid(0, 0)` before `execvp()`, making its PID the group ID.
+RETRACE can then send a signal to the whole group with a negative identifier:
+
+```c
+kill(-target_process_group, SIGTERM);
+```
+
+This reaches descendants that remain in the group, unlike `kill(target_pid,
+SIGTERM)`, which addresses only the leader. RETRACE blocks `SIGINT` and `SIGTERM`
+around `fork()` and receives them through Linux `signalfd`. Because that
+descriptor participates in `poll()` beside stdout and stderr, ordinary C++ code
+can forward and record signals without running containers, streams, or callbacks
+inside an asynchronous signal handler. The child restores the caller's original
+signal mask before replacing its process image, and the parent restores it when
+supervision ends.
+
+The selected working directory follows a similar pre-`exec` rule. The CLI first
+resolves and validates the directory so a bad path cannot create a misleading
+trace. The child still calls `chdir()` and reports its saved `errno` through the
+launch-status pipe because the filesystem may change between validation and use.
+This repeated check handles the time-of-check/time-of-use boundary honestly.
+
+The C examples show two explicit outcome paths. `normal.c` checks each stream
+operation and returns `EXIT_SUCCESS`; `crash.c` calls `raise(SIGSEGV)` so the
+recorder observes deliberate signal termination without relying on undefined
+behavior.
 
 ## Habits to practice now
 

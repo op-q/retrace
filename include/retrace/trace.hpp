@@ -26,6 +26,7 @@ enum class EventType : std::uint16_t {  // NOLINT(performance-enum-size)
   process_exit = 5U,
   process_signal = 6U,
   process_launch_failure = 7U,
+  signal_receive = 8U,
 };
 
 struct Metadata {

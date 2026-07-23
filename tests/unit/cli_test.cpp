@@ -2,7 +2,9 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -17,6 +19,10 @@
 
 #include "retrace/trace.hpp"
 #include "retrace/version.hpp"
+
+#ifndef RETRACE_SIGNAL_FIXTURE_PATH
+#error "RETRACE_SIGNAL_FIXTURE_PATH must name the signal fixture executable"
+#endif
 
 namespace {
 
@@ -56,6 +62,30 @@ class TemporaryPath final {
 
   TemporaryPath(const TemporaryPath&) = delete;
   TemporaryPath& operator=(const TemporaryPath&) = delete;
+
+  [[nodiscard]] const std::string& value() const noexcept { return path_; }
+
+ private:
+  std::string path_;
+};
+
+class TemporaryDirectory final {
+ public:
+  TemporaryDirectory() {
+    path_ = "/tmp/retrace-cli-directory-XXXXXX";
+    if (::mkdtemp(path_.data()) == nullptr) {
+      path_.clear();
+    }
+  }
+
+  ~TemporaryDirectory() {
+    if (!path_.empty()) {
+      ::rmdir(path_.c_str());
+    }
+  }
+
+  TemporaryDirectory(const TemporaryDirectory&) = delete;
+  TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
 
   [[nodiscard]] const std::string& value() const noexcept { return path_; }
 
@@ -207,6 +237,59 @@ void test_version_rejects_extra_arguments(TestContext& test) {
               "version with extra arguments has no normal output");
   test.expect(error.str().find("does not accept arguments") != std::string::npos,
               "version with extra arguments explains the error");
+}
+
+void test_run_records_a_forwarded_signal(TestContext& test) {
+  TemporaryPath trace_path;
+  test.expect(!trace_path.value().empty(),
+              "a temporary signal trace path is available");
+  if (trace_path.value().empty()) {
+    return;
+  }
+
+  const std::array arguments{std::string_view{"run"},
+                             std::string_view{"--output"},
+                             std::string_view{trace_path.value()},
+                             std::string_view{"--"},
+                             std::string_view{RETRACE_SIGNAL_FIXTURE_PATH},
+                             std::string_view{"--request-term"}};
+  std::ostringstream output;
+  std::ostringstream error;
+  const auto result = retrace::cli::run(arguments, output, error);
+
+  test.expect(result == static_cast<int>(retrace::cli::ExitCode::success),
+              "run succeeds when the target group handles a forwarded signal");
+  test.expect(output.str() == "ready\nforwarded\n",
+              "run forwards output around the handled signal");
+  test.expect(error.str().empty(),
+              "a handled forwarded signal produces no run diagnostic");
+
+  const auto frames = read_trace_frames(trace_path.value());
+  const auto signal_frame =
+      std::find_if(frames.begin(), frames.end(), [](const TraceFrame& frame) {
+        return frame.type ==
+               static_cast<std::uint16_t>(retrace::trace::EventType::signal_receive);
+      });
+  test.expect(signal_frame != frames.end(),
+              "the trace records the signal received for forwarding");
+  if (signal_frame != frames.end()) {
+    test.expect(signal_frame->payload.size() == sizeof(std::uint32_t) &&
+                    static_cast<unsigned char>(signal_frame->payload[0]) == SIGTERM,
+                "the signal trace event preserves SIGTERM");
+  }
+
+  const std::array inspect_arguments{std::string_view{"inspect"},
+                                     std::string_view{trace_path.value()}};
+  std::ostringstream inspect_output;
+  std::ostringstream inspect_error;
+  const auto inspect_result =
+      retrace::cli::run(inspect_arguments, inspect_output, inspect_error);
+  test.expect(inspect_result == static_cast<int>(retrace::cli::ExitCode::success) &&
+                  inspect_output.str().find("signal.receive") != std::string::npos &&
+                  inspect_output.str().find("signal=15") != std::string::npos,
+              "inspect renders the forwarded-signal evidence");
+  test.expect(inspect_error.str().empty(),
+              "inspection of signal evidence has no diagnostic");
 }
 
 void test_trace_commands_require_exactly_one_path(TestContext& test) {
@@ -609,9 +692,96 @@ void test_run_requires_a_target_after_separator(TestContext& test) {
   test.expect(result == static_cast<int>(retrace::cli::ExitCode::usage_error),
               "run without a target returns a usage error");
   test.expect(output.str().empty(), "invalid run syntax has no normal output");
+  test.expect(error.str() ==
+                  "usage: retrace run [--output TRACE] [--working-directory PATH] -- "
+                  "COMMAND [ARGS...]\n",
+              "invalid run syntax shows the exact command shape");
+}
+
+void test_run_help_describes_implemented_behavior(TestContext& test) {
+  constexpr std::array arguments{std::string_view{"run"}, std::string_view{"--help"}};
+  std::ostringstream output;
+  std::ostringstream error;
+
+  const auto result = retrace::cli::run(arguments, output, error);
+
+  test.expect(result == static_cast<int>(retrace::cli::ExitCode::success),
+              "run --help returns success");
+  test.expect(output.str().starts_with("Usage:\n  retrace run") &&
+                  output.str().find("--output TRACE") != std::string::npos &&
+                  output.str().find("--working-directory PATH") != std::string::npos &&
+                  output.str().find("SIGINT and SIGTERM") != std::string::npos,
+              "run help describes every implemented run control");
+  test.expect(error.str().empty(), "run --help has no error output");
+}
+
+void test_run_selects_and_records_working_directory(TestContext& test) {
+  TemporaryDirectory directory;
+  TemporaryPath trace_path;
+  test.expect(!directory.value().empty() && !trace_path.value().empty(),
+              "working-directory test paths are available");
+  if (directory.value().empty() || trace_path.value().empty()) {
+    return;
+  }
+
+  const std::array arguments{std::string_view{"run"},
+                             std::string_view{"--working-directory"},
+                             std::string_view{directory.value()},
+                             std::string_view{"--output"},
+                             std::string_view{trace_path.value()},
+                             std::string_view{"--"},
+                             std::string_view{"/bin/pwd"}};
+  std::ostringstream output;
+  std::ostringstream error;
+  const auto result = retrace::cli::run(arguments, output, error);
+
+  test.expect(result == static_cast<int>(retrace::cli::ExitCode::success),
+              "run accepts a selected working directory");
+  test.expect(output.str() == directory.value() + "\n",
+              "the CLI target observes the selected working directory");
+  test.expect(error.str().empty(),
+              "a valid selected working directory has no diagnostic");
+
+  retrace::trace::Reader reader;
+  const auto open_error = retrace::trace::Reader::open(trace_path.value(), reader);
+  test.expect(!open_error, "the working-directory trace can be opened");
+  if (!open_error) {
+    test.expect(reader.header().working_directory == directory.value(),
+                "trace metadata records the target's selected directory");
+  }
+}
+
+void test_run_rejects_a_missing_working_directory_before_trace_creation(
+    TestContext& test) {
+  TemporaryPath trace_path;
+  test.expect(!trace_path.value().empty(),
+              "a missing trace path is available for directory validation");
+  if (trace_path.value().empty()) {
+    return;
+  }
+
+  const std::array arguments{
+      std::string_view{"run"},
+      std::string_view{"--output"},
+      std::string_view{trace_path.value()},
+      std::string_view{"--working-directory"},
+      std::string_view{"/definitely/not/a/retrace-working-directory"},
+      std::string_view{"--"},
+      std::string_view{"/bin/true"}};
+  std::ostringstream output;
+  std::ostringstream error;
+  const auto result = retrace::cli::run(arguments, output, error);
+
+  test.expect(result == static_cast<int>(retrace::cli::ExitCode::internal_error),
+              "a missing selected directory returns an internal error");
+  test.expect(output.str().empty(),
+              "an invalid selected directory does not launch the target");
   test.expect(
-      error.str() == "usage: retrace run [--output TRACE] -- COMMAND [ARGS...]\n",
-      "invalid run syntax shows the exact command shape");
+      error.str().starts_with("error: working directory could not be selected\n") &&
+          error.str().find("target was not started") != std::string::npos,
+      "working-directory validation explains that the target did not run");
+  test.expect(::access(trace_path.value().c_str(), F_OK) != 0,
+              "working-directory validation happens before trace creation");
 }
 
 void test_run_preserves_target_exit_code(TestContext& test) {
@@ -759,6 +929,7 @@ int main() {
   test_version(test);
   test_unknown_command(test);
   test_version_rejects_extra_arguments(test);
+  test_run_records_a_forwarded_signal(test);
   test_trace_commands_require_exactly_one_path(test);
   test_trace_commands_report_a_missing_file(test);
   test_validate_accepts_a_structurally_valid_trace(test);
@@ -771,6 +942,9 @@ int main() {
   test_malformed_event_reports_the_complete_prefix(test);
   test_truncated_trace_preserves_the_complete_inspection_prefix(test);
   test_run_requires_a_target_after_separator(test);
+  test_run_help_describes_implemented_behavior(test);
+  test_run_selects_and_records_working_directory(test);
+  test_run_rejects_a_missing_working_directory_before_trace_creation(test);
   test_run_preserves_target_exit_code(test);
   test_run_reports_a_missing_executable(test);
   test_run_routes_target_output(test);

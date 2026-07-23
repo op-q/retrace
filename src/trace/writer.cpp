@@ -266,6 +266,7 @@ std::error_code Writer::write_event(const EventType type,
     case EventType::process_exit:
     case EventType::process_signal:
     case EventType::process_launch_failure:
+    case EventType::signal_receive:
       if (payload.size() != sizeof(std::uint32_t)) {
         return std::make_error_code(std::errc::invalid_argument);
       }
@@ -309,7 +310,7 @@ std::error_code Writer::write_value_event(const EventType type,
                                           const std::uint32_t process_id,
                                           const std::uint32_t value) {
   if (type != EventType::process_exit && type != EventType::process_signal &&
-      type != EventType::process_launch_failure) {
+      type != EventType::process_launch_failure && type != EventType::signal_receive) {
     return std::make_error_code(std::errc::invalid_argument);
   }
   std::array<std::byte, sizeof(value)> payload{};

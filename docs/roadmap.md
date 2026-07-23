@@ -11,7 +11,11 @@ the main implementation until current acceptance criteria are met.
 - compiler warnings, optional sanitizers, formatting, and CI
 - documentation and repository safety guardrails
 
-## v0.1 progress — process execution
+## v0.1 implementation — process recorder
+
+The feature slice is implemented. This means the behavior below exists and has
+focused automated coverage; it does not yet mean that a supported v0.1 release
+has been published.
 
 - [x] Add move-only RAII file-descriptor and pipe owners.
 - [x] Launch a command with `fork()` and `execvp()`.
@@ -21,9 +25,17 @@ the main implementation until current acceptance criteria are met.
 - [x] Capture stdout and stderr with pipes.
 - [x] Create a versioned trace and lifecycle events.
 - [x] Inspect and validate traces.
-- [ ] Create a process group and forward signals.
+- [x] Create a process group and forward signals.
+- [x] Select and record a target working directory.
+- [x] Document normal and intentional-crash examples.
 
-## v0.1 — process recorder
+## v0.1 release boundary
+
+The first release is the Linux process recorder described below. Runtime
+injection, fault scenarios, container support, and broader process-tree
+visibility remain outside this boundary. Before calling a revision v0.1, run
+and record every applicable item in the
+[v0.1 release checklist](release-checklist.md).
 
 Commands:
 
@@ -54,6 +66,9 @@ Acceptance criteria:
 - validation rejects malformed inputs safely;
 - unit, integration, and supported sanitizer tests pass; and
 - normal and crashing example programs are documented.
+
+Implementation acceptance is complete. Release readiness still requires a
+fresh candidate-wide safety, toolchain, documentation, and manual behavior pass.
 
 ## v0.2 — injected C runtime
 

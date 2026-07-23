@@ -7,6 +7,7 @@
 #include <cerrno>
 #include <charconv>
 #include <csignal>
+#include <cstdlib>
 #include <iostream>
 #include <span>
 #include <string>
@@ -16,6 +17,10 @@
 
 #ifndef RETRACE_STREAM_FIXTURE_PATH
 #error "RETRACE_STREAM_FIXTURE_PATH must name the stream fixture executable"
+#endif
+
+#ifndef RETRACE_SIGNAL_FIXTURE_PATH
+#error "RETRACE_SIGNAL_FIXTURE_PATH must name the signal fixture executable"
 #endif
 
 namespace {
@@ -33,6 +38,30 @@ class TestContext {
 
  private:
   int failures_ = 0;
+};
+
+class TemporaryDirectory final {
+ public:
+  TemporaryDirectory() {
+    path_ = "/tmp/retrace-process-test-XXXXXX";
+    if (::mkdtemp(path_.data()) == nullptr) {
+      path_.clear();
+    }
+  }
+
+  ~TemporaryDirectory() {
+    if (!path_.empty()) {
+      ::rmdir(path_.c_str());
+    }
+  }
+
+  TemporaryDirectory(const TemporaryDirectory&) = delete;
+  TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
+
+  [[nodiscard]] const std::string& value() const noexcept { return path_; }
+
+ private:
+  std::string path_;
 };
 
 struct ObservedEvent {
@@ -127,6 +156,56 @@ void test_arguments_are_preserved(TestContext& test) {
   test.expect(result.exit_code == 0, "spaces inside a target argument are preserved");
 }
 
+void test_working_directory_is_selected(TestContext& test) {
+  TemporaryDirectory directory;
+  test.expect(!directory.value().empty(),
+              "a temporary target working directory is available");
+  if (directory.value().empty()) {
+    return;
+  }
+
+  constexpr std::array arguments{std::string_view{"/bin/pwd"}};
+  CapturedOutput captured;
+  const auto result = retrace::process::execute(
+      arguments,
+      [&captured](const retrace::process::ProcessEvent& event) {
+        return captured.append(event);
+      },
+      {.working_directory = directory.value()});
+
+  test.expect(
+      result.state == retrace::process::ProcessState::exited && result.exit_code == 0,
+      "a target launches in the selected working directory");
+  test.expect(captured.standard_output == directory.value() + "\n",
+              "the target observes the selected working directory");
+}
+
+void test_invalid_working_directory_is_a_launch_failure(TestContext& test) {
+  constexpr std::array arguments{std::string_view{"/bin/true"}};
+  const auto result = retrace::process::execute(
+      arguments, {},
+      {.working_directory = "/definitely/not/a/retrace-working-directory"});
+
+  test.expect(result.state == retrace::process::ProcessState::launch_failed,
+              "a failed child chdir is a target launch failure");
+  test.expect(
+      result.error == std::make_error_code(std::errc::no_such_file_or_directory),
+      "a failed child chdir preserves ENOENT");
+}
+
+void test_embedded_nul_working_directory_is_rejected(TestContext& test) {
+  constexpr std::array arguments{std::string_view{"/bin/true"}};
+  const std::string path_with_nul{"/tmp\0ignored", 12U};
+  const auto result =
+      retrace::process::execute(arguments, {}, {.working_directory = path_with_nul});
+
+  test.expect(result.state == retrace::process::ProcessState::supervisor_failed,
+              "an embedded NUL working directory is rejected by the supervisor");
+  test.expect(result.error == std::make_error_code(std::errc::invalid_argument) &&
+                  result.process_id == 0,
+              "an invalid working-directory byte view is rejected before fork");
+}
+
 void test_signal_exit(TestContext& test) {
   constexpr std::array arguments{std::string_view{"/bin/sh"}, std::string_view{"-c"},
                                  std::string_view{"kill -TERM $$"}};
@@ -137,6 +216,89 @@ void test_signal_exit(TestContext& test) {
               "a signaled target is distinct from an ordinary exit");
   test.expect(result.signal_number == SIGTERM,
               "the terminating signal number is preserved");
+}
+
+void test_signal_is_forwarded_to_target_group(TestContext& test,
+                                              const int signal_number,
+                                              const std::string_view fixture_option) {
+  std::array<int, 2> report_pipe{-1, -1};
+  test.expect(::pipe(report_pipe.data()) == 0,
+              "a report pipe is available for the signal-forwarding test");
+  if (report_pipe[0] < 0 || report_pipe[1] < 0) {
+    return;
+  }
+
+  const pid_t test_child = ::fork();
+  test.expect(test_child >= 0, "the signal-forwarding supervisor can be isolated");
+  if (test_child < 0) {
+    ::close(report_pipe[0]);
+    ::close(report_pipe[1]);
+    return;
+  }
+
+  if (test_child == 0) {
+    ::close(report_pipe[0]);
+    const std::array arguments{std::string_view{RETRACE_SIGNAL_FIXTURE_PATH},
+                               fixture_option};
+    CapturedOutput captured;
+    int forwarded_count = 0;
+    int forwarded_value = 0;
+    bool signal_sent = false;
+
+    const auto result = retrace::process::execute(
+        arguments, [&](const retrace::process::ProcessEvent& event) {
+          const auto append_error = captured.append(event);
+          if (event.type == retrace::process::ProcessEventType::signal_forwarded) {
+            ++forwarded_count;
+            forwarded_value = event.value;
+          }
+          if (!signal_sent &&
+              event.type == retrace::process::ProcessEventType::standard_output &&
+              event.bytes.find("ready\n") != std::string_view::npos) {
+            signal_sent = ::kill(::getpid(), signal_number) == 0;
+          }
+          return append_error;
+        });
+
+    sigset_t current_mask{};
+    const bool mask_read = ::sigprocmask(SIG_SETMASK, nullptr, &current_mask) == 0;
+    const std::array report{
+        static_cast<int>(result.state),
+        result.exit_code,
+        forwarded_count,
+        forwarded_value,
+        signal_sent ? 1 : 0,
+        captured.standard_output == "ready\nforwarded\n" ? 1 : 0,
+        mask_read && ::sigismember(&current_mask, signal_number) == 0 ? 1 : 0};
+    const auto ignored = ::write(report_pipe[1], report.data(), sizeof(report));
+    static_cast<void>(ignored);
+    ::_exit(0);
+  }
+
+  ::close(report_pipe[1]);
+  std::array<int, 7> report{};
+  const auto bytes_read = ::read(report_pipe[0], report.data(), sizeof(report));
+  ::close(report_pipe[0]);
+  int wait_status = 0;
+  const auto waited = ::waitpid(test_child, &wait_status, 0);
+
+  test.expect(waited == test_child && WIFEXITED(wait_status),
+              "the isolated signal-forwarding supervisor exits normally");
+  test.expect(bytes_read == static_cast<ssize_t>(sizeof(report)),
+              "the isolated supervisor reports its forwarding result");
+  if (bytes_read != static_cast<ssize_t>(sizeof(report))) {
+    return;
+  }
+  test.expect(report[0] == static_cast<int>(retrace::process::ProcessState::exited) &&
+                  report[1] == 0,
+              "the signal-aware target group handles the forwarded signal");
+  test.expect(report[2] == 1 && report[3] == signal_number,
+              "signal forwarding emits exactly one event with the signal number");
+  test.expect(report[4] == 1, "the supervisor process receives the test signal");
+  test.expect(report[5] == 1,
+              "the target leader and descendant both observe the forwarded signal");
+  test.expect(report[6] == 1,
+              "the caller's original signal mask is restored after supervision");
 }
 
 void test_missing_executable(TestContext& test) {
@@ -377,7 +539,12 @@ int main() {
   test_nonzero_exit(test);
   test_exit_127_is_not_a_launch_failure(test);
   test_arguments_are_preserved(test);
+  test_working_directory_is_selected(test);
+  test_invalid_working_directory_is_a_launch_failure(test);
+  test_embedded_nul_working_directory_is_rejected(test);
   test_signal_exit(test);
+  test_signal_is_forwarded_to_target_group(test, SIGINT, "--expect-int");
+  test_signal_is_forwarded_to_target_group(test, SIGTERM, "--expect-term");
   test_missing_executable(test);
   test_handler_failure_overrides_launch_failure(test);
   test_process_lifecycle_events(test);

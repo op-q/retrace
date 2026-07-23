@@ -13,6 +13,10 @@ build.
 - RETRACE launches only the command supplied after `run --` and waits for it.
 - The target inherits the invoking environment and standard input; its stdout
   and stderr are redirected to RETRACE pipes.
+- The target runs as the leader of a new process group. `SIGINT` and `SIGTERM`
+  received during supervision are forwarded to that group.
+- `--working-directory PATH` is resolved and checked before trace creation; the
+  child independently changes directory before replacing its process image.
 - RETRACE concurrently relays stdout and stderr without storing a complete copy.
 - `--output TRACE` records command arguments, working directory, lifecycle, and
   stdout/stderr chunks. It does not record environment variables, file contents,

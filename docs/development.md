@@ -7,6 +7,7 @@ The current scaffold is intentionally smaller than the final architecture:
 ```text
 include/retrace/       public C/C++ interfaces
 src/                   C++ application and core implementation
+examples/              small normal and intentional-crash C targets
 tests/                 unit and integration tests plus deterministic fixtures
 cmake/                 reusable build policies and generated-header templates
 docs/                  product and engineering documentation
@@ -17,9 +18,9 @@ scripts/               local formatting, testing, and safety checks
 
 `src/` is split into CLI, process, and trace components; a fault component will
 be added with that milestone. `runtime/` will contain the C shared library only
-when milestone v0.2 begins. `examples/`, `scenarios/`, and integration fixtures
-should be added with the behavior they demonstrate rather than as empty
-directories.
+when milestone v0.2 begins. `examples/` contains the normal and intentional-crash
+recorder demonstrations. `scenarios/` will be added with its first implemented
+behavior rather than as an empty directory.
 
 ## Technology choices
 
@@ -65,7 +66,12 @@ nondecreasing timestamps, unknown event identifiers, and every truncation point
 across representative frames. CLI tests cover inspection, structural
 validation, escaped output, failed output streams, and their usage, I/O, and
 trace-format exit codes. Process tests also verify that a descendant retaining
-inherited stream descriptors cannot hold the direct target's capture open.
+inherited stream descriptors cannot hold the direct target's capture open,
+selected working directories are preserved, both forwarded signals reach the
+target group, and the caller's original signal mask is restored. CTest also runs
+the normal and intentional-crash examples through the CLI in unsanitized builds;
+sanitizer builds omit the deliberate crash while retaining signal integration
+coverage.
 
 As features land, unit tests will cover duration, signal, and rule parsing; path
 matching; encoding and decoding; format bounds; rendering; and corrupt payloads.
@@ -104,4 +110,7 @@ performance overhead, known issues, architecture, examples, and both guarantees
 and non-guarantees.
 
 The README remains a quick entry point. Detailed decisions belong in focused
-documents, and behavior-changing pull requests update them with the code.
+documents, and behavior-changing pull requests update them with the code. The
+[documentation map](README.md) identifies each source of truth, and the
+[release checklist](release-checklist.md) defines the evidence required for the
+v0.1 candidate.

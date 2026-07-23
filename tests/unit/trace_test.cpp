@@ -364,6 +364,9 @@ void test_event_schema_validation(TestContext& test) {
     test.expect(writer.write_event(retrace::trace::EventType::process_launch_failure,
                                    7U, "wrong") == invalid_argument,
                 "process-launch-failure rejects a value payload of the wrong size");
+    test.expect(writer.write_event(retrace::trace::EventType::signal_receive, 7U,
+                                   "bad") == invalid_argument,
+                "signal-receive rejects a value payload of the wrong size");
     test.expect(writer.write_value_event(retrace::trace::EventType::standard_output, 7U,
                                          1U) == invalid_argument,
                 "write_value_event rejects a stream event type");
@@ -377,10 +380,13 @@ void test_event_schema_validation(TestContext& test) {
     test.expect(
         !writer.write_value_event(retrace::trace::EventType::process_signal, 7U, 9U),
         "write_value_event accepts a value-bearing event type");
+    test.expect(
+        !writer.write_value_event(retrace::trace::EventType::signal_receive, 7U, 15U),
+        "write_value_event accepts signal-receive evidence");
   }
 
   const auto bytes = read_file(path.value());
-  test.expect(count_complete_frames(bytes) == 2U,
+  test.expect(count_complete_frames(bytes) == 3U,
               "rejected event shapes append no frames");
 }
 

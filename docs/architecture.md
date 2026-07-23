@@ -3,10 +3,12 @@
 ## Product boundary
 
 Today, RETRACE launches one command, collects its stdout and stderr concurrently,
-forwards both streams, and can write command metadata and observed lifecycle and
-stream events to a versioned trace. It can also validate that trace's v1.0
-structure and render its complete events as a terminal timeline. Process groups,
-signal forwarding, trace export, and fault injection are not yet implemented.
+forwards both streams, selects a target working directory, and can write command
+metadata and observed lifecycle and stream events to a versioned trace. Each
+target leads a process group; RETRACE synchronously receives `SIGINT` and
+`SIGTERM`, forwards them to that group, and records successful forwarding. It can
+also validate a trace's v1.0 structure and render its complete events as a
+terminal timeline. Trace export and fault injection are not yet implemented.
 
 The target architecture will supervise the command, record selected runtime
 events, and write them to a trace. Later it will reproduce explicitly configured
@@ -39,35 +41,37 @@ The public interface should remain stable even while internals evolve.
 
 ### Supervisor
 
-The current C++ process layer owns command launch, close-on-exec pipes, concurrent
-stream collection, typed lifecycle events, and waiting. It distinguishes a
-launch failure from a target that exits with status 127 and preserves normal exit
-and signal status. A bounded buffer feeds events to a callback instead of
+The current C++ process layer owns command launch, the target process group,
+close-on-exec pipes, synchronous signal forwarding, concurrent stream
+collection, typed lifecycle events, and waiting. It distinguishes a launch
+failure from a target that exits with status 127 and preserves normal exit and
+signal status. A bounded buffer feeds events to a callback instead of
 accumulating all target output in memory. The planned supervisor will also own
-process groups, signal forwarding, and runtime-event collection. It must state
-whether a usable partial trace exists.
+runtime-event collection. It must state whether a usable partial trace exists.
 
 Child status is checked while the stream pipes are polled. Once the direct child
 is reaped, the collector snapshots and drains only bytes already queued in each
 pipe, then closes its read ends. This preserves buffered direct-child output
 without allowing a descendant that inherited a write end to extend collection
-forever. Descendant lifecycle control still requires the planned process group.
+forever. Descendants share the target process group for signal delivery, but
+RETRACE still waits for and reports only the direct target.
 
-The planned launch sequence is:
+The current launch sequence is:
 
-1. Parse the command and scenario.
-2. Create the trace and stdout, stderr, and event pipes.
+1. Parse the command and validate the selected working directory.
+2. Create the trace, stdout/stderr pipes, launch-status pipe, and signal source.
 3. Call `fork()`.
-4. In the child, create the target process group, redirect descriptors,
-   configure the runtime environment, and call `execve()`.
-5. In the parent, close unused pipe ends, record `process.start`, collect
-   events, forward signals, and wait with `waitpid()`.
+4. In the child, create the target process group, restore the inherited signal
+   mask, change directory, redirect descriptors, and call `execvp()`.
+5. In the parent, close unused pipe ends, record `process.start`, poll streams
+   and the signal source, forward signals with `kill(-pgid, signal)`, and check
+   completion with `waitpid()`.
 6. Finish all complete frame writes and close the trace. Version 1.0 has no
    footer or durable-finalization record.
 
-Child-process support will grow in phases: supervise the original target first,
-then report `fork`/`exec`, then track descendants in the process group. Linux
-subreaper behavior may be evaluated later.
+Child-process support will grow in phases. The original target is supervised and
+descendants receive group-directed signals, but descendant discovery and event
+tracking remain later work. Linux subreaper behavior may be evaluated later.
 
 ### Injected runtime
 

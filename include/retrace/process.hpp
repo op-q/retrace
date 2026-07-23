@@ -20,6 +20,7 @@ enum class ProcessEventType : std::uint8_t {
   exec_succeeded,
   standard_output,
   standard_error,
+  signal_forwarded,
   exited,
   signaled,
   launch_failed,
@@ -45,9 +46,16 @@ struct ProcessResult {
   std::error_code error;
 };
 
+struct ExecuteOptions {
+  // Empty means inherit the caller's working directory. The byte view must not
+  // contain NUL because chdir(2) consumes a NUL-terminated path.
+  std::string_view working_directory;
+};
+
 // An empty list or an argument containing an embedded NUL is rejected before
 // fork because execvp(3) accepts only NUL-terminated argument strings.
 [[nodiscard]] ProcessResult execute(std::span<const std::string_view> arguments,
-                                    const ProcessEventHandler& event_handler = {});
+                                    const ProcessEventHandler& event_handler = {},
+                                    const ExecuteOptions& options = {});
 
 }  // namespace retrace::process

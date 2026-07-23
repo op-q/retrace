@@ -116,6 +116,7 @@ endianness can differ.
 | 5 | `process.exit` | `u32` exit status |
 | 6 | `process.signal` | `u32` signal number |
 | 7 | `process.launch_failure` | `u32` saved `errno` |
+| 8 | `signal.receive` | `u32` signal number |
 
 `process.start` records the child created by `fork()`. `process.exec` is emitted
 when the close-on-exec launch-status pipe reaches EOF without reporting an
@@ -130,10 +131,14 @@ Chunk timestamps record supervisor observation order. Separate stdout and stderr
 pipes preserve byte order within each stream, but cannot prove exact write order
 between streams when both are already readable.
 
+`signal.receive` records a `SIGINT` or `SIGTERM` received by RETRACE and
+successfully forwarded to the target process group. It is distinct from
+`process.signal`, which records that the direct target was ultimately terminated
+by a signal. A target may handle a forwarded signal and exit normally.
+
 ## Planned event extensions
 
-Later process and signal work may add `process.fork`, `signal.receive`, and
-`signal.inject`.
+Later process and signal work may add `process.fork` and `signal.inject`.
 
 File events, introduced with the C runtime:
 
@@ -187,7 +192,8 @@ For each event it checks the bounded frame length before allocating, verifies
 the redundant payload length and zero flags, and requires nondecreasing
 timestamps. It also enforces the v1.0 payload schemas: `process.start` and
 `process.exec` are empty, stream chunks contain arbitrary bounded bytes, and
-exit, signal, and launch-failure payloads are exactly one little-endian `u32`.
+exit, signal, launch-failure, and signal-receive payloads are exactly one
+little-endian `u32`.
 Unknown event identifiers remain valid when their surrounding frame is valid;
 the reader exposes their type, thread ID, and opaque bounded payload without
 assigning semantics.

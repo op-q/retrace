@@ -106,6 +106,8 @@ constexpr std::size_t displayed_argument_count = 16U;
       return "process.signal";
     case trace::EventType::process_launch_failure:
       return "process.launch_failure";
+    case trace::EventType::signal_receive:
+      return "signal.receive";
   }
   return {};
 }
@@ -181,6 +183,9 @@ void render_event(const trace::Event& event, std::ostream& output,
     summary.result = ResultKind::launch_failed;
     summary.result_value = decode_u32(event.payload);
     output << " errno=" << summary.result_value;
+  } else if (event.type ==
+             static_cast<std::uint16_t>(trace::EventType::signal_receive)) {
+    output << " signal=" << decode_u32(event.payload);
   } else if (name.empty()) {
     output << " tid=" << event.thread_id << " bytes=" << event.payload.size()
            << " preview=" << escaped(event.payload, stream_preview_size);

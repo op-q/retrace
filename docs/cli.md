@@ -1,14 +1,14 @@
 # Command-line interface
 
-`version`, help, `run -- COMMAND [ARGS...]`, explicit trace creation,
-inspection, and structural validation are implemented. Export, scenarios,
-filters, and the remaining run options are planned. Examples are labeled where
-they describe future behavior.
+`version`, help, `run -- COMMAND [ARGS...]`, selected working directories,
+explicit trace creation, signal forwarding, inspection, and structural
+validation are implemented. Export, scenarios, filters, and the remaining run
+options are planned. Examples are labeled where they describe future behavior.
 
 ## Commands
 
 ```text
-retrace run [--output TRACE] -- COMMAND [ARGS...]
+retrace run [--output TRACE] [--working-directory PATH] -- COMMAND [ARGS...]
 retrace inspect TRACE
 retrace validate TRACE
 retrace version
@@ -16,22 +16,31 @@ retrace version
 
 Planned commands include `export` and `scenario`.
 
+`retrace run --help` prints the implemented run options and signal behavior.
+
 ## Run a target
 
 ```bash
-retrace run [--output TRACE] -- COMMAND [ARGS...]
+retrace run [--output TRACE] [--working-directory PATH] -- COMMAND [ARGS...]
 ```
 
 Everything after `--` belongs to the target. RETRACE currently launches the
-command with `fork()` and `execvp()`, collects stdout and stderr concurrently
-through separate pipes, forwards them to its own corresponding streams, waits
-with `waitpid()`, and returns the target's exit code. A target killed by a signal
-returns the usual shell-style `128 + signal` status. A missing executable returns
-RETRACE code `5`.
+command with `fork()` and `execvp()`, places it in a new process group, collects
+stdout and stderr concurrently through separate pipes, forwards them to its own
+corresponding streams, waits with `waitpid()`, and returns the target's exit
+code. `SIGINT` and `SIGTERM` received during supervision are forwarded to the
+whole target group. A target killed by a signal returns the usual shell-style
+`128 + signal` status. A missing executable returns RETRACE code `5`.
+
+`--working-directory PATH` resolves an existing directory before trace creation
+or target launch. The child calls `chdir()` before `execvp()`, and the resolved
+directory is stored in trace metadata. A relative `--output` path remains
+relative to RETRACE's own directory; the supervisor does not change directory.
 
 Without `--output`, RETRACE only relays captured streams. With `--output TRACE`,
 it creates a new v1.0 file and records command metadata, `process.start`,
-`process.exec`, stdout/stderr chunks, and the final exit or signal. A failed
+`process.exec`, stdout/stderr chunks, successfully forwarded signals, and the
+final exit or signal. A failed
 `execvp()` is recorded separately from target exit status 127. `process.exec`
 means that the close-on-exec launch-status pipe reached EOF without reporting an
 `execvp()` error. It normally follows a successful replacement, but cannot prove
@@ -47,8 +56,9 @@ differently.
 The direct target is reaped while its streams are collected. If a descendant
 keeps an inherited stream open after that target exits, RETRACE drains the bytes
 already queued at the exit observation and then closes its read ends; a daemon
-cannot keep `run` waiting indefinitely. Process groups and supervision of those
-descendants remain the next milestone.
+cannot keep `run` waiting indefinitely. Descendants receive group-directed
+signals, but RETRACE does not yet discover or report their individual lifecycle
+events.
 
 Planned options include:
 
@@ -62,15 +72,14 @@ Planned options include:
 --capture-stdout
 --capture-stderr
 --no-runtime
---working-directory PATH
 --environment KEY=VALUE
 --inherit-environment KEY
 --verbose
 ```
 
-A completed v0.1 run will create a session, capture configured streams, record
-process metadata, write all recoverable trace data, and print an exit summary.
-A crash must not erase already completed frames.
+A v0.1 run creates a session, captures both streams, records process metadata,
+and writes all recoverable trace data. A crash does not erase already completed
+frames.
 
 ## Inspect a trace
 
@@ -164,9 +173,11 @@ Possible export formats include JSON, JSON Lines, and later Chrome Trace Event.
 retrace run --kill-after 5s --signal SIGTERM -- ./server
 ```
 
-RETRACE will forward `SIGINT` and `SIGTERM` to the target process group, record
-whether a signal came from the user or a scenario, allow a bounded graceful-exit
-period, and escalate only when configured.
+RETRACE currently receives `SIGINT` and `SIGTERM` through a pollable signal
+source and forwards them to the target process group. A successful forwarding
+is recorded as `signal.receive`; the target's eventual signal termination is a
+separate `process.signal` event. Source classification, `--kill-after`, a
+graceful-exit period, escalation, and scenario-driven signals remain planned.
 
 ## Exit codes
 

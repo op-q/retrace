@@ -28,6 +28,21 @@ Commands:
   help     Explain how to use RETRACE
 )";
 
+constexpr std::string_view run_usage =
+    "usage: retrace run [--output TRACE] [--working-directory PATH] -- "
+    "COMMAND [ARGS...]\n";
+
+constexpr std::string_view run_help_text = R"(Usage:
+  retrace run [--output TRACE] [--working-directory PATH] -- COMMAND [ARGS...]
+
+Options:
+  --output TRACE             Record the run without overwriting TRACE
+  --working-directory PATH   Run the target from an existing directory
+
+Signals:
+  SIGINT and SIGTERM received by RETRACE are forwarded to the target group.
+)";
+
 [[nodiscard]] bool is_help(const std::string_view argument) {
   return argument == "help" || argument == "--help" || argument == "-h";
 }
@@ -59,6 +74,7 @@ Commands:
   }
   if ((event.type == process::ProcessEventType::exited ||
        event.type == process::ProcessEventType::signaled ||
+       event.type == process::ProcessEventType::signal_forwarded ||
        event.type == process::ProcessEventType::launch_failed) &&
       event.value < 0) {
     return std::make_error_code(std::errc::protocol_error);
@@ -76,6 +92,9 @@ Commands:
     case process::ProcessEventType::standard_error:
       return writer.write_event(trace::EventType::standard_error, process_id,
                                 event.bytes);
+    case process::ProcessEventType::signal_forwarded:
+      return writer.write_value_event(trace::EventType::signal_receive, process_id,
+                                      static_cast<std::uint32_t>(event.value));
     case process::ProcessEventType::exited:
       return writer.write_value_event(trace::EventType::process_exit, process_id,
                                       static_cast<std::uint32_t>(event.value));
@@ -93,6 +112,7 @@ Commands:
 
 struct RunArguments {
   std::optional<std::string_view> output_path;
+  std::optional<std::string_view> working_directory;
   std::span<const std::string_view> target;
 };
 
@@ -100,11 +120,16 @@ struct RunArguments {
     const std::span<const std::string_view> arguments, RunArguments& result) {
   std::size_t index = 1U;
   while (index < arguments.size() && arguments[index] != "--") {
-    if (arguments[index] != "--output" || result.output_path ||
-        index + 1U >= arguments.size()) {
+    if (index + 1U >= arguments.size()) {
       return false;
     }
-    result.output_path = arguments[index + 1U];
+    if (arguments[index] == "--output" && !result.output_path) {
+      result.output_path = arguments[index + 1U];
+    } else if (arguments[index] == "--working-directory" && !result.working_directory) {
+      result.working_directory = arguments[index + 1U];
+    } else {
+      return false;
+    }
     index += 2U;
   }
 
@@ -118,13 +143,8 @@ struct RunArguments {
 
 [[nodiscard]] trace::CreationResult create_trace_writer(
     const std::string_view output_path,
-    const std::span<const std::string_view> target_arguments, trace::Writer& writer) {
-  std::error_code error;
-  const auto working_directory = std::filesystem::current_path(error);
-  if (error) {
-    return {.error = error};
-  }
-
+    const std::span<const std::string_view> target_arguments,
+    const std::filesystem::path& working_directory, trace::Writer& writer) {
   utsname system_information{};
   if (::uname(&system_information) < 0) {
     return {.error = {errno, std::generic_category()}};
@@ -144,16 +164,47 @@ struct RunArguments {
 
 [[nodiscard]] int run_target(const std::span<const std::string_view> arguments,
                              std::ostream& output, std::ostream& error) {
+  if (arguments.size() == 2U && is_help(arguments[1])) {
+    output << run_help_text;
+    return static_cast<int>(ExitCode::success);
+  }
+
   RunArguments run_arguments;
   if (!parse_run_arguments(arguments, run_arguments)) {
-    error << "usage: retrace run [--output TRACE] -- COMMAND [ARGS...]\n";
+    error << run_usage;
     return static_cast<int>(ExitCode::usage_error);
+  }
+
+  std::error_code working_directory_error;
+  std::filesystem::path working_directory;
+  if (run_arguments.working_directory) {
+    if (run_arguments.working_directory->empty() ||
+        run_arguments.working_directory->find('\0') != std::string_view::npos) {
+      working_directory_error = std::make_error_code(std::errc::invalid_argument);
+    } else {
+      working_directory = std::filesystem::canonical(
+          std::filesystem::path{std::string{*run_arguments.working_directory}},
+          working_directory_error);
+      if (!working_directory_error &&
+          !std::filesystem::is_directory(working_directory, working_directory_error)) {
+        working_directory_error = std::make_error_code(std::errc::not_a_directory);
+      }
+    }
+  } else {
+    working_directory = std::filesystem::current_path(working_directory_error);
+  }
+  if (working_directory_error) {
+    error << "error: working directory could not be selected\n"
+          << "cause: " << working_directory_error.message() << '\n'
+          << "target was not started\n";
+    return static_cast<int>(ExitCode::internal_error);
   }
 
   trace::Writer trace_writer;
   if (run_arguments.output_path) {
-    const auto creation = create_trace_writer(*run_arguments.output_path,
-                                              run_arguments.target, trace_writer);
+    const auto creation =
+        create_trace_writer(*run_arguments.output_path, run_arguments.target,
+                            working_directory, trace_writer);
     if (creation.error) {
       error << "error: trace could not be created\n"
             << "cause: " << creation.error.message() << '\n'
@@ -166,9 +217,11 @@ struct RunArguments {
   }
 
   std::error_code trace_error;
+  const auto& working_directory_bytes = working_directory.native();
   const auto result = process::execute(
-      run_arguments.target, [&output, &error, &trace_writer,
-                             &trace_error](const process::ProcessEvent& event) {
+      run_arguments.target,
+      [&output, &error, &trace_writer,
+       &trace_error](const process::ProcessEvent& event) {
         if (trace_writer.is_open() && !trace_error) {
           trace_error = record_event(trace_writer, event);
         }
@@ -179,7 +232,8 @@ struct RunArguments {
         auto& destination =
             event.type == process::ProcessEventType::standard_output ? output : error;
         return forward_output(destination, event.bytes);
-      });
+      },
+      {.working_directory = working_directory_bytes});
 
   if (trace_writer.is_open()) {
     const auto finish_error = trace_writer.finish();

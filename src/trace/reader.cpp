@@ -184,6 +184,7 @@ class HeaderCursor final {
     case EventType::process_exit:
     case EventType::process_signal:
     case EventType::process_launch_failure:
+    case EventType::signal_receive:
       return true;
   }
   return false;
@@ -204,6 +205,7 @@ class HeaderCursor final {
     case EventType::process_exit:
     case EventType::process_signal:
     case EventType::process_launch_failure:
+    case EventType::signal_receive:
       return event.payload.size() == sizeof(std::uint32_t);
   }
   return false;

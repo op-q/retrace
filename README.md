@@ -14,6 +14,9 @@ failure conditions deliberately.
 RETRACE is pre-alpha but has a working process-recording and inspection slice:
 
 - `retrace run` launches a command and preserves its arguments;
+- `run --working-directory PATH` selects and records the target directory;
+- each target leads a process group, and received `SIGINT`/`SIGTERM` signals are
+  forwarded to that group and recorded;
 - normal exits and signal termination are returned to the caller;
 - launch failure is distinguished from a target that exits with status 127;
 - stdout and stderr are collected concurrently through separate pipes and
@@ -27,7 +30,7 @@ RETRACE is pre-alpha but has a working process-recording and inspection slice:
 - dependency-free tests exercise the CLI, process and trace layers, and a C
   stream fixture.
 
-Process groups, signal forwarding, trace export, and fault injection are not
+Time limits, trace export, runtime instrumentation, and fault injection are not
 implemented yet. A successful validation means that the bytes are structurally
 valid v1.0; because v1.0 has no footer or checksum, it does not prove that a run
 was finalized or that its contents are authentic.
@@ -42,6 +45,7 @@ The current runner can execute a target:
 ./build/dev/bin/retrace run -- /bin/echo "hello from RETRACE"
 ./build/dev/bin/retrace run -- python3 -c 'print("hello from Python")'
 ./build/dev/bin/retrace run --output /tmp/example.rtc -- /bin/echo recorded
+./build/dev/bin/retrace run --working-directory /tmp -- /bin/pwd
 ```
 
 Recorded traces can be inspected or structurally validated:
@@ -51,8 +55,8 @@ Recorded traces can be inspected or structurally validated:
 ./build/dev/bin/retrace validate /tmp/example.rtc
 ```
 
-The next v0.1 engineering milestone is process-group creation and signal
-forwarding.
+The v0.1 process-recorder slice is implemented. The next work is release
+hardening; the injected runtime remains deferred to v0.2.
 
 Later releases will add a small C runtime loaded with `LD_PRELOAD` so selected
 libc operations can be observed and controlled:
@@ -91,14 +95,17 @@ No third-party runtime or test dependencies are used at this stage.
 
 ## Documentation
 
+- [Documentation map](docs/README.md)
 - [Architecture](docs/architecture.md)
 - [Product goals and scope](docs/product.md)
 - [Development design](docs/development.md)
 - [CLI design](docs/cli.md)
 - [Trace format](docs/trace-format.md)
+- [Recorder examples](docs/examples.md)
 - [Fault rules](docs/fault-rules.md)
 - [Security model](docs/security.md)
 - [Roadmap](docs/roadmap.md)
+- [v0.1 release checklist](docs/release-checklist.md)
 - [C and C++ learning guide](docs/learning-c-and-cpp.md)
 - [Contributing](CONTRIBUTING.md)
 

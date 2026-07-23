@@ -2,7 +2,9 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/signalfd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -17,6 +19,7 @@
 #include <vector>
 
 #include "pipe.hpp"
+#include "unique_fd.hpp"
 
 namespace retrace::process {
 namespace {
@@ -24,6 +27,54 @@ namespace {
 [[nodiscard]] std::error_code system_error(const int error_number) {
   return {error_number, std::generic_category()};
 }
+
+class ForwardedSignals final {
+ public:
+  ForwardedSignals() = default;
+  ~ForwardedSignals() { [[maybe_unused]] const auto restore_error = restore_mask(); }
+
+  ForwardedSignals(const ForwardedSignals&) = delete;
+  ForwardedSignals& operator=(const ForwardedSignals&) = delete;
+
+  [[nodiscard]] std::error_code start() {
+    if (::sigemptyset(&signals_) < 0 || ::sigaddset(&signals_, SIGINT) < 0 ||
+        ::sigaddset(&signals_, SIGTERM) < 0) {
+      return system_error(errno);
+    }
+    if (::sigprocmask(SIG_BLOCK, &signals_, &previous_mask_) < 0) {
+      return system_error(errno);
+    }
+    mask_changed_ = true;
+
+    const int descriptor = ::signalfd(-1, &signals_, SFD_CLOEXEC | SFD_NONBLOCK);
+    if (descriptor < 0) {
+      const auto create_error = system_error(errno);
+      [[maybe_unused]] const auto restore_error = restore_mask();
+      return create_error;
+    }
+    descriptor_.reset(descriptor);
+    return {};
+  }
+
+  [[nodiscard]] std::error_code restore_mask() noexcept {
+    if (!mask_changed_) {
+      return {};
+    }
+    mask_changed_ = false;
+    if (::sigprocmask(SIG_SETMASK, &previous_mask_, nullptr) < 0) {
+      return system_error(errno);
+    }
+    return {};
+  }
+
+  [[nodiscard]] int descriptor() const noexcept { return descriptor_.get(); }
+
+ private:
+  sigset_t signals_{};
+  sigset_t previous_mask_{};
+  UniqueFd descriptor_;
+  bool mask_changed_ = false;
+};
 
 void send_launch_error(const int descriptor, const int error_number) noexcept {
   const auto* bytes = reinterpret_cast<const char*>(&error_number);
@@ -117,6 +168,7 @@ struct MonitoredStream {
 struct CaptureResult {
   int wait_status = 0;
   std::error_code output_error;
+  std::error_code signal_error;
   std::error_code wait_error;
 };
 
@@ -155,6 +207,44 @@ struct ChildPollResult {
   std::error_code error;
 };
 
+[[nodiscard]] std::error_code forward_pending_signals(const int signal_descriptor,
+                                                      EventDispatcher& events,
+                                                      const pid_t process_group) {
+  while (true) {
+    signalfd_siginfo information{};
+    ssize_t read_result = -1;
+    do {
+      read_result = ::read(signal_descriptor, &information, sizeof(information));
+    } while (read_result < 0 && errno == EINTR);
+
+    if (read_result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return {};
+    }
+    if (read_result < 0) {
+      return system_error(errno);
+    }
+    if (read_result != static_cast<ssize_t>(sizeof(information))) {
+      return std::make_error_code(std::errc::protocol_error);
+    }
+
+    const auto signal_number = static_cast<int>(information.ssi_signo);
+    if (signal_number != SIGINT && signal_number != SIGTERM) {
+      return std::make_error_code(std::errc::protocol_error);
+    }
+
+    int kill_result = -1;
+    do {
+      kill_result = ::kill(-process_group, signal_number);
+    } while (kill_result < 0 && errno == EINTR);
+
+    if (kill_result == 0) {
+      events.send(ProcessEventType::signal_forwarded, signal_number);
+    } else if (errno != ESRCH) {
+      return system_error(errno);
+    }
+  }
+}
+
 [[nodiscard]] ChildPollResult poll_for_child(const pid_t child) {
   ChildPollResult poll;
   pid_t result = -1;
@@ -173,19 +263,25 @@ struct ChildPollResult {
 [[nodiscard]] CaptureResult capture_output_and_wait(const pid_t child,
                                                     Pipe& standard_output,
                                                     Pipe& standard_error,
+                                                    const int signal_descriptor,
                                                     EventDispatcher& events) {
   constexpr std::size_t stream_count = 2U;
+  constexpr std::size_t descriptor_count = stream_count + 1U;
   constexpr int child_poll_interval_milliseconds = 50;
   std::array<MonitoredStream, stream_count> streams{
       MonitoredStream{&standard_output, ProcessEventType::standard_output},
       MonitoredStream{&standard_error, ProcessEventType::standard_error}};
   std::array<char, std::size_t{16U} * 1024U> buffer{};
   CaptureResult result;
-  std::size_t open_streams = stream_count;
   std::size_t first_stream = 0U;
   bool child_reaped = false;
 
-  while (open_streams > 0U && !child_reaped) {
+  while (!child_reaped) {
+    if (const auto error = forward_pending_signals(signal_descriptor, events, child)) {
+      result.signal_error = error;
+      break;
+    }
+
     const auto child_poll = poll_for_child(child);
     if (child_poll.error) {
       result.wait_error = child_poll.error;
@@ -197,11 +293,13 @@ struct ChildPollResult {
       break;
     }
 
-    std::array<pollfd, stream_count> descriptors{};
+    std::array<pollfd, descriptor_count> descriptors{};
     for (std::size_t index = 0; index < stream_count; ++index) {
       descriptors[index].fd = streams[index].pipe->read_descriptor();
       descriptors[index].events = POLLIN;
     }
+    descriptors[stream_count].fd = signal_descriptor;
+    descriptors[stream_count].events = POLLIN;
 
     int poll_result = -1;
     do {
@@ -211,6 +309,17 @@ struct ChildPollResult {
 
     if (poll_result < 0) {
       result.output_error = system_error(errno);
+      break;
+    }
+
+    if ((descriptors[stream_count].revents & POLLIN) != 0) {
+      if (const auto error =
+              forward_pending_signals(signal_descriptor, events, child)) {
+        result.signal_error = error;
+        break;
+      }
+    } else if (descriptors[stream_count].revents != 0) {
+      result.signal_error = std::make_error_code(std::errc::io_error);
       break;
     }
 
@@ -230,7 +339,6 @@ struct ChildPollResult {
           result.output_error = std::make_error_code(std::errc::bad_file_descriptor);
         }
         monitored.pipe->close_read_end();
-        --open_streams;
         continue;
       }
       if ((ready_events & (POLLIN | POLLHUP)) == 0) {
@@ -238,7 +346,6 @@ struct ChildPollResult {
           result.output_error = std::make_error_code(std::errc::io_error);
         }
         monitored.pipe->close_read_end();
-        --open_streams;
         continue;
       }
 
@@ -250,7 +357,6 @@ struct ChildPollResult {
 
       if (read_result == 0) {
         monitored.pipe->close_read_end();
-        --open_streams;
         continue;
       }
       if (read_result < 0) {
@@ -258,7 +364,6 @@ struct ChildPollResult {
           result.output_error = system_error(errno);
         }
         monitored.pipe->close_read_end();
-        --open_streams;
         continue;
       }
 
@@ -339,11 +444,14 @@ struct ChildPollResult {
 }  // namespace
 
 ProcessResult execute(const std::span<const std::string_view> arguments,
-                      const ProcessEventHandler& event_handler) {
+                      const ProcessEventHandler& event_handler,
+                      const ExecuteOptions& options) {
   if (arguments.empty() ||
-      std::any_of(arguments.begin(), arguments.end(), [](const auto argument) {
-        return argument.find('\0') != std::string_view::npos;
-      })) {
+      std::any_of(arguments.begin(), arguments.end(),
+                  [](const auto argument) {
+                    return argument.find('\0') != std::string_view::npos;
+                  }) ||
+      options.working_directory.find('\0') != std::string_view::npos) {
     return {.state = ProcessState::supervisor_failed,
             .error = std::make_error_code(std::errc::invalid_argument)};
   }
@@ -361,6 +469,8 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
   }
   argument_pointers.push_back(nullptr);
 
+  const std::string owned_working_directory{options.working_directory};
+
   Pipe launch_errors;
   if (const auto error = Pipe::create(launch_errors)) {
     return {.state = ProcessState::supervisor_failed, .error = error};
@@ -374,6 +484,11 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     return {.state = ProcessState::supervisor_failed, .error = error};
   }
 
+  ForwardedSignals forwarded_signals;
+  if (const auto error = forwarded_signals.start()) {
+    return {.state = ProcessState::supervisor_failed, .error = error};
+  }
+
   const pid_t child = ::fork();
   if (child < 0) {
     return {.state = ProcessState::supervisor_failed, .error = system_error(errno)};
@@ -383,6 +498,20 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     launch_errors.close_read_end();
     standard_output.close_read_end();
     standard_error.close_read_end();
+
+    if (::setpgid(0, 0) < 0) {
+      send_launch_error(launch_errors.write_descriptor(), errno);
+      ::_exit(127);
+    }
+    if (const auto error = forwarded_signals.restore_mask()) {
+      send_launch_error(launch_errors.write_descriptor(), error.value());
+      ::_exit(127);
+    }
+    if (!owned_working_directory.empty() &&
+        ::chdir(owned_working_directory.c_str()) < 0) {
+      send_launch_error(launch_errors.write_descriptor(), errno);
+      ::_exit(127);
+    }
 
     if (const int error =
             redirect_descriptor(standard_output.write_descriptor(), STDOUT_FILENO);
@@ -423,13 +552,25 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     events.send(ProcessEventType::launch_failed, launch_error.error_number);
   }
 
-  const auto capture =
-      capture_output_and_wait(child, standard_output, standard_error, events);
+  const auto capture = capture_output_and_wait(child, standard_output, standard_error,
+                                               forwarded_signals.descriptor(), events);
+
+  const auto signal_restore_error = forwarded_signals.restore_mask();
 
   if (capture.wait_error) {
     return {.state = ProcessState::supervisor_failed,
             .process_id = static_cast<int>(child),
             .error = capture.wait_error};
+  }
+  if (capture.signal_error) {
+    return {.state = ProcessState::supervisor_failed,
+            .process_id = static_cast<int>(child),
+            .error = capture.signal_error};
+  }
+  if (signal_restore_error) {
+    return {.state = ProcessState::supervisor_failed,
+            .process_id = static_cast<int>(child),
+            .error = signal_restore_error};
   }
 
   if (launch_error.error) {
