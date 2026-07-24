@@ -252,6 +252,27 @@ operation and returns `EXIT_SUCCESS`; `crash.c` calls `raise(SIGSEGV)` so the
 recorder observes deliberate signal termination without relying on undefined
 behavior.
 
+## Lesson 12: a small C runtime handshake
+
+The first injected-runtime slice is a C17 shared library. A function marked with
+the compiler's `constructor` attribute runs when the dynamic loader loads that
+library, before the target reaches `main`. Constructor code deserves unusual
+restraint: the target has not initialized its application state, and a failure
+must not prevent an otherwise valid program from starting.
+
+The runtime therefore performs one bounded action. It parses an explicitly
+inherited descriptor without allocation, encodes a fixed 16-byte handshake, and
+sends it through a Unix-domain `SOCK_SEQPACKET` socket. The bytes are written
+field by field in little-endian order. Copying an in-memory C struct would also
+copy compiler-selected padding and native byte order, making the protocol depend
+on the build rather than its documented contract.
+
+`MSG_NOSIGNAL` prevents a vanished receiver from delivering `SIGPIPE` to the
+target. `MSG_DONTWAIT` prevents a full channel from blocking target startup.
+Every failure is ignored after restoring the `errno` value that existed on
+entry. This is deliberate fail-open instrumentation: losing observability is
+reported by the future supervisor, but it does not become a new target failure.
+
 ## Habits to practice now
 
 - Read compiler warnings; do not merely silence them.

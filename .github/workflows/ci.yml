@@ -47,7 +47,7 @@ jobs:
 
       - name: Run clang-tidy
         run: |
-          mapfile -t sources < <(git ls-files '*.cpp')
+          mapfile -t sources < <(git ls-files '*.cpp' 'runtime/*.c')
           clang-tidy --warnings-as-errors='*' -p build/ci "${sources[@]}"
 
   build-and-test:

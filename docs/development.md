@@ -7,6 +7,7 @@ The current scaffold is intentionally smaller than the final architecture:
 ```text
 include/retrace/       public C/C++ interfaces
 src/                   C++ application and core implementation
+runtime/               injected C17 shared library
 examples/              small normal and intentional-crash C targets
 tests/                 unit and integration tests plus deterministic fixtures
 cmake/                 reusable build policies and generated-header templates
@@ -17,10 +18,11 @@ scripts/               local formatting, testing, and safety checks
 ```
 
 `src/` is split into CLI, process, and trace components; a fault component will
-be added with that milestone. `runtime/` will contain the C shared library only
-when milestone v0.2 begins. `examples/` contains the normal and intentional-crash
-recorder demonstrations. `scenarios/` will be added with its first implemented
-behavior rather than as an empty directory.
+be added with that milestone. `runtime/` contains the first v0.2 C shared-library
+slice and will grow only with tested handshake, transport, and interposition
+behavior. `examples/` contains the normal and intentional-crash recorder
+demonstrations. `scenarios/` will be added with its first implemented behavior
+rather than as an empty directory.
 
 ## Technology choices
 
