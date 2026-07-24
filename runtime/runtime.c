@@ -1,3 +1,6 @@
+// Injected C17 runtime. Its constructor performs one fail-open handshake while
+// preserving the target's errno and avoiding allocation-heavy runtime state.
+
 #include <errno.h>
 #include <limits.h>
 #include <stddef.h>
@@ -19,6 +22,8 @@ static void store_u32_le(unsigned char* const destination, const uint32_t value)
 }
 
 static int parse_event_descriptor(const char* const text) {
+  // Manual decimal parsing avoids locale, allocation, and ambiguous partial
+  // conversions during dynamic-loader startup.
   if (text == NULL || text[0] == '\0') {
     return -1;
   }
@@ -42,6 +47,8 @@ static int parse_event_descriptor(const char* const text) {
 }
 
 static void emit_handshake(void) {
+  // The runtime is a guest inside another process: instrumentation failure must
+  // not block startup, raise SIGPIPE, or alter the caller-visible errno value.
   const int saved_errno = errno;
   const int descriptor = parse_event_descriptor(getenv(RETRACE_RUNTIME_EVENT_FD_ENV));
 

@@ -1,3 +1,4 @@
+# Security reports must use GitHub's private advisory channel.
 blank_issues_enabled: false
 contact_links:
   - name: Report a security vulnerability

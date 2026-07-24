@@ -1,3 +1,7 @@
+// Tests the CLI as a library by replacing terminal streams with string streams.
+// It covers exact diagnostics, trace creation, inspection, validation, and the
+// mapping between process outcomes and public exit codes.
+
 #include "retrace/cli.hpp"
 
 #include <unistd.h>
@@ -22,6 +26,10 @@
 
 #ifndef RETRACE_SIGNAL_FIXTURE_PATH
 #error "RETRACE_SIGNAL_FIXTURE_PATH must name the signal fixture executable"
+#endif
+
+#ifndef RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH
+#error "RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH must name the runtime channel fixture"
 #endif
 
 namespace {
@@ -863,6 +871,51 @@ void test_recording_reports_incomplete_trace_after_output_failure(TestContext& t
       "a finalized writer does not hide semantic trace incompleteness");
 }
 
+void test_run_records_a_runtime_handshake(TestContext& test) {
+  TemporaryPath trace_path;
+  test.expect(!trace_path.value().empty(),
+              "a temporary runtime-handshake trace path is available");
+  if (trace_path.value().empty()) {
+    return;
+  }
+
+  const std::array arguments{std::string_view{"run"},
+                             std::string_view{"--output"},
+                             std::string_view{trace_path.value()},
+                             std::string_view{"--"},
+                             std::string_view{RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH},
+                             std::string_view{"load-runtime"}};
+  std::ostringstream output;
+  std::ostringstream error;
+  const auto result = retrace::cli::run(arguments, output, error);
+
+  test.expect(result == static_cast<int>(retrace::cli::ExitCode::success),
+              "run succeeds when the target runtime handshakes");
+  test.expect(output.str().empty() && error.str().empty(),
+              "a runtime handshake does not contaminate target streams");
+
+  const auto frames = read_trace_frames(trace_path.value());
+  const auto handshake =
+      std::find_if(frames.begin(), frames.end(), [](const auto& frame) {
+        return frame.type ==
+               static_cast<std::uint16_t>(retrace::trace::EventType::runtime_handshake);
+      });
+  test.expect(handshake != frames.end() && handshake->payload.empty(),
+              "recording stores an empty runtime-handshake frame");
+
+  const std::array inspect_arguments{std::string_view{"inspect"},
+                                     std::string_view{trace_path.value()}};
+  std::ostringstream inspect_output;
+  std::ostringstream inspect_error;
+  const auto inspect_result =
+      retrace::cli::run(inspect_arguments, inspect_output, inspect_error);
+  test.expect(inspect_result == static_cast<int>(retrace::cli::ExitCode::success) &&
+                  inspect_output.str().find("runtime.handshake") != std::string::npos,
+              "inspect renders runtime handshake evidence");
+  test.expect(inspect_error.str().empty(),
+              "a valid runtime handshake trace has no inspection diagnostic");
+}
+
 void test_run_writes_an_explicit_trace_without_overwriting(TestContext& test) {
   TemporaryPath trace_path;
   test.expect(!trace_path.value().empty(), "a temporary CLI trace path is available");
@@ -949,6 +1002,7 @@ int main() {
   test_run_reports_a_missing_executable(test);
   test_run_routes_target_output(test);
   test_recording_reports_incomplete_trace_after_output_failure(test);
+  test_run_records_a_runtime_handshake(test);
   test_run_writes_an_explicit_trace_without_overwriting(test);
   return test.result();
 }

@@ -1,5 +1,8 @@
 #pragma once
 
+// Public API for RETRACE's append-only binary trace. Writer and Reader are
+// move-only descriptor owners; format constants below are compatibility limits.
+
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -27,9 +30,11 @@ enum class EventType : std::uint16_t {  // NOLINT(performance-enum-size)
   process_signal = 6U,
   process_launch_failure = 7U,
   signal_receive = 8U,
+  runtime_handshake = 9U,
 };
 
 struct Metadata {
+  // Views are consumed synchronously by Writer::create and need not outlive it.
   std::string_view retrace_version;
   std::string_view operating_system;
   std::string_view architecture;
@@ -71,6 +76,8 @@ struct Header {
 };
 
 struct Event {
+  // Reader owns payload storage here. Unknown type IDs are intentionally kept
+  // as raw u16 values so newer traces remain inspectable by older readers.
   std::uint16_t type = 0U;
   std::uint16_t flags = 0U;
   std::uint64_t offset_nanoseconds = 0U;

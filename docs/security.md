@@ -11,8 +11,10 @@ build.
 
 - The current `run` command does not require root.
 - RETRACE launches only the command supplied after `run --` and waits for it.
-- The target inherits the invoking environment and standard input; its stdout
-  and stderr are redirected to RETRACE pipes.
+- The target inherits the invoking environment and standard input, except that
+  every caller-provided `RETRACE_RUNTIME_EVENT_FD` entry is replaced with the
+  supervisor's intended endpoint; stdout and stderr are redirected to RETRACE
+  pipes.
 - The target runs as the leader of a new process group. `SIGINT` and `SIGTERM`
   received during supervision are forwarded to that group.
 - `--working-directory PATH` is resolved and checked before trace creation; the
@@ -58,10 +60,12 @@ has no footer, checksum, signature, or finalization record. A clean frame-bounda
 EOF therefore cannot prove that the original writer finished, that a suffix was
 not lost, that bytes were not modified, or that data is safe to disclose.
 
-Before runtime injection ships, the injected runtime must preserve `errno`,
-prevent recursion, minimize allocation and locking inside hooks, and normally
-let the target continue if its event channel fails. It will not offer
-container-grade isolation.
+The runtime handshake preserves `errno`, avoids allocation, and lets the target
+continue if its event channel fails. The supervisor bounds and validates each
+sequenced packet and rejects malformed protocol input. Before operation
+interposition ships, hooks must additionally prevent recursion and minimize
+allocation and locking. Runtime instrumentation will not offer container-grade
+isolation.
 
 ## Repository secret policy
 

@@ -1,3 +1,8 @@
+# Test graph overview:
+# - unit executables call library APIs directly;
+# - C fixtures provide deterministic target-process behavior;
+# - smoke tests exercise the final CLI executable through CTest.
+
 add_executable(retrace_cli_test unit/cli_test.cpp)
 target_link_libraries(retrace_cli_test PRIVATE retrace::core)
 target_compile_definitions(
@@ -23,6 +28,8 @@ retrace_enable_sanitizers(retrace_trace_reader_test "${RETRACE_SANITIZER}")
 
 add_test(NAME trace-reader.unit COMMAND retrace_trace_reader_test)
 
+# Target fixtures are ordinary executables, not test runners. Their absolute
+# build paths are injected into tests with generator expressions.
 add_executable(retrace_stream_fixture fixtures/stream_fixture.c)
 retrace_set_project_warnings(retrace_stream_fixture)
 retrace_enable_sanitizers(retrace_stream_fixture "${RETRACE_SANITIZER}")
@@ -31,6 +38,29 @@ add_executable(retrace_signal_fixture fixtures/signal_fixture.c)
 retrace_set_project_warnings(retrace_signal_fixture)
 retrace_enable_sanitizers(retrace_signal_fixture "${RETRACE_SANITIZER}")
 add_dependencies(retrace_cli_test retrace_signal_fixture)
+
+add_executable(retrace_runtime_channel_fixture fixtures/runtime_channel_fixture.c)
+target_include_directories(
+  retrace_runtime_channel_fixture
+  PRIVATE "${PROJECT_SOURCE_DIR}/include"
+)
+target_compile_definitions(
+  retrace_runtime_channel_fixture
+  PRIVATE RETRACE_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:retrace_runtime>"
+)
+target_link_libraries(retrace_runtime_channel_fixture PRIVATE "${CMAKE_DL_LIBS}")
+retrace_set_project_warnings(retrace_runtime_channel_fixture)
+retrace_enable_sanitizers(
+  retrace_runtime_channel_fixture
+  "${RETRACE_SANITIZER}"
+)
+add_dependencies(retrace_runtime_channel_fixture retrace_runtime)
+target_compile_definitions(
+  retrace_cli_test
+  PRIVATE
+    RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH="$<TARGET_FILE:retrace_runtime_channel_fixture>"
+)
+add_dependencies(retrace_cli_test retrace_runtime_channel_fixture)
 
 add_executable(retrace_runtime_test runtime/runtime_test.c)
 target_include_directories(
@@ -51,16 +81,24 @@ target_link_libraries(retrace_process_test PRIVATE retrace::core)
 target_compile_definitions(
   retrace_process_test
   PRIVATE
+    RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH="$<TARGET_FILE:retrace_runtime_channel_fixture>"
     RETRACE_SIGNAL_FIXTURE_PATH="$<TARGET_FILE:retrace_signal_fixture>"
     RETRACE_STREAM_FIXTURE_PATH="$<TARGET_FILE:retrace_stream_fixture>"
 )
-add_dependencies(retrace_process_test retrace_signal_fixture retrace_stream_fixture)
+add_dependencies(
+  retrace_process_test
+  retrace_runtime_channel_fixture
+  retrace_signal_fixture
+  retrace_stream_fixture
+)
 retrace_set_project_warnings(retrace_process_test)
 retrace_enable_sanitizers(retrace_process_test "${RETRACE_SANITIZER}")
 
 add_test(NAME process.integration COMMAND retrace_process_test)
 add_test(NAME runtime.handshake COMMAND retrace_runtime_test)
 
+# Lightweight black-box checks catch mistakes in final linking and command
+# registration that direct library tests cannot see.
 add_test(NAME cli.version COMMAND retrace version)
 set_tests_properties(
   cli.version

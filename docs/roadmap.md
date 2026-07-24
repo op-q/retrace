@@ -18,7 +18,7 @@ focused automated coverage; it does not yet mean that a supported v0.1 release
 has been published.
 
 - [x] Add move-only RAII file-descriptor and pipe owners.
-- [x] Launch a command with `fork()` and `execvp()`.
+- [x] Launch a command with `fork()` and `execvpe()`.
 - [x] Preserve target arguments.
 - [x] Distinguish an `exec` failure from target exit code 127.
 - [x] Preserve ordinary exit codes and terminating signals.
@@ -48,8 +48,8 @@ retrace validate TRACE
 Work sequence:
 
 1. Add RAII file-descriptor and pipe types.
-2. Launch a command with `fork()` and `execvp()`; use explicit environment
-   handling when configuration support requires `execve()`.
+2. Launch a command with `fork()` and `execvpe()` using an explicitly rebuilt
+   environment when supervisor configuration requires it.
 3. Capture its exit code or terminating signal.
 4. Capture stdout and stderr while preserving order as accurately as practical.
 5. Write a versioned, framed, crash-tolerant trace.
@@ -85,7 +85,7 @@ Initial progress:
 - [x] Build a C17 `libretrace_runtime.so`.
 - [x] Define and emit a versioned, bounded handshake frame.
 - [x] Keep absent, invalid, and closed event channels nonfatal.
-- [ ] Create and validate the runtime channel in the supervisor.
+- [x] Create and validate the runtime channel in the supervisor.
 - [ ] Load the runtime into supported dynamic targets.
 - [ ] Interpose and record the selected libc operations.
 

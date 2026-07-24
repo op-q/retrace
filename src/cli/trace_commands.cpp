@@ -1,3 +1,6 @@
+// Implements safe terminal rendering and structural validation for trace files.
+// All trace-controlled bytes are escaped and bounded before reaching a terminal.
+
 #include "trace_commands.hpp"
 
 #include <algorithm>
@@ -33,6 +36,8 @@ constexpr std::size_t displayed_argument_count = 16U;
 
 [[nodiscard]] std::string escaped(const std::string_view bytes,
                                   const std::size_t maximum_bytes) {
+  // Escaping is a security boundary: raw trace bytes may contain terminal
+  // control sequences, invalid text, embedded NULs, or very large payloads.
   constexpr std::string_view hexadecimal = "0123456789abcdef";
   const auto preview_size = std::min(bytes.size(), maximum_bytes);
   std::string result;
@@ -108,6 +113,8 @@ constexpr std::size_t displayed_argument_count = 16U;
       return "process.launch_failure";
     case trace::EventType::signal_receive:
       return "signal.receive";
+    case trace::EventType::runtime_handshake:
+      return "runtime.handshake";
   }
   return {};
 }
@@ -153,6 +160,8 @@ struct InspectionSummary {
 
 void render_event(const trace::Event& event, std::ostream& output,
                   InspectionSummary& summary) {
+  // Known events receive semantic fields; unknown IDs keep an opaque, escaped
+  // preview so forward-compatible traces remain understandable.
   ++summary.event_count;
   summary.duration_nanoseconds = event.offset_nanoseconds;
 

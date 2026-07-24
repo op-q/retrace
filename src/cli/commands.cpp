@@ -1,3 +1,6 @@
+// Implements the user-facing command router and `run` workflow: parse options,
+// optionally open a trace, supervise the target, and map outcomes to CLI codes.
+
 #include <sys/utsname.h>
 
 #include <cerrno>
@@ -69,6 +72,8 @@ Signals:
 
 [[nodiscard]] std::error_code record_event(trace::Writer& writer,
                                            const process::ProcessEvent& event) {
+  // Process events are an in-memory contract. This switch is the explicit
+  // translation boundary into stable on-disk trace event IDs and payloads.
   if (event.process_id <= 0) {
     return std::make_error_code(std::errc::protocol_error);
   }
@@ -86,6 +91,8 @@ Signals:
       return writer.write_event(trace::EventType::process_start, process_id);
     case process::ProcessEventType::exec_succeeded:
       return writer.write_event(trace::EventType::process_exec, process_id);
+    case process::ProcessEventType::runtime_handshake:
+      return writer.write_event(trace::EventType::runtime_handshake, process_id);
     case process::ProcessEventType::standard_output:
       return writer.write_event(trace::EventType::standard_output, process_id,
                                 event.bytes);
@@ -118,6 +125,8 @@ struct RunArguments {
 
 [[nodiscard]] bool parse_run_arguments(
     const std::span<const std::string_view> arguments, RunArguments& result) {
+  // Parsing stays dependency-free while the option surface is small. Each
+  // accepted option consumes exactly one following value.
   std::size_t index = 1U;
   while (index < arguments.size() && arguments[index] != "--") {
     if (index + 1U >= arguments.size()) {
@@ -145,6 +154,8 @@ struct RunArguments {
     const std::string_view output_path,
     const std::span<const std::string_view> target_arguments,
     const std::filesystem::path& working_directory, trace::Writer& writer) {
+  // System identity and the canonical working directory become immutable trace
+  // metadata before the target starts.
   utsname system_information{};
   if (::uname(&system_information) < 0) {
     return {.error = {errno, std::generic_category()}};
@@ -164,6 +175,8 @@ struct RunArguments {
 
 [[nodiscard]] int run_target(const std::span<const std::string_view> arguments,
                              std::ostream& output, std::ostream& error) {
+  // Setup errors occur before process::execute so diagnostics can truthfully say
+  // whether the target was ever started.
   if (arguments.size() == 2U && is_help(arguments[1])) {
     output << run_help_text;
     return static_cast<int>(ExitCode::success);

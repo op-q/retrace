@@ -1,3 +1,10 @@
+// Linux process supervisor: owns fork/exec, process groups, stream collection,
+// signal forwarding, runtime IPC, lifecycle events, and final wait status.
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "retrace/process.hpp"
 
 #include <fcntl.h>
@@ -19,6 +26,8 @@
 #include <vector>
 
 #include "pipe.hpp"
+#include "retrace/runtime_protocol.h"
+#include "runtime_channel.hpp"
 #include "unique_fd.hpp"
 
 namespace retrace::process {
@@ -28,6 +37,34 @@ namespace {
   return {error_number, std::generic_category()};
 }
 
+void build_target_environment(const int runtime_descriptor,
+                              std::vector<std::string>& owned_environment,
+                              std::vector<char*>& environment_pointers) {
+  // Build all strings before the char* array so vector growth cannot invalidate
+  // pointers. Every caller-provided channel value is removed, then one trusted
+  // descriptor entry is appended.
+  const std::string runtime_prefix = std::string{RETRACE_RUNTIME_EVENT_FD_ENV} + '=';
+
+  if (environ != nullptr) {
+    for (auto cursor = environ; *cursor != nullptr; ++cursor) {
+      const std::string_view entry{*cursor};
+      if (!entry.starts_with(runtime_prefix)) {
+        owned_environment.emplace_back(entry);
+      }
+    }
+  }
+  owned_environment.push_back(runtime_prefix + std::to_string(runtime_descriptor));
+
+  environment_pointers.reserve(owned_environment.size() + 1U);
+  for (auto& entry : owned_environment) {
+    environment_pointers.push_back(entry.data());
+  }
+  environment_pointers.push_back(nullptr);
+}
+
+// Signals are blocked and consumed through signalfd, turning asynchronous
+// delivery into an ordinary pollable descriptor. The original mask is RAII
+// state that must be restored on every parent/child exit path.
 class ForwardedSignals final {
  public:
   ForwardedSignals() = default;
@@ -77,6 +114,8 @@ class ForwardedSignals final {
 };
 
 void send_launch_error(const int descriptor, const int error_number) noexcept {
+  // The close-on-exec launch pipe is a tiny parent/child protocol: either the
+  // child writes one errno, or successful exec closes the descriptor at EOF.
   const auto* bytes = reinterpret_cast<const char*>(&error_number);
   std::size_t bytes_written = 0;
 
@@ -168,10 +207,13 @@ struct MonitoredStream {
 struct CaptureResult {
   int wait_status = 0;
   std::error_code output_error;
+  std::error_code runtime_error;
   std::error_code signal_error;
   std::error_code wait_error;
 };
 
+// A handler failure stops future callback delivery but never abandons the
+// child; supervision continues until streams are drained and the PID reaped.
 class EventDispatcher final {
  public:
   EventDispatcher(const int process_id, const ProcessEventHandler& handler)
@@ -200,6 +242,33 @@ class EventDispatcher final {
   const ProcessEventHandler& handler_;
   std::error_code error_;
 };
+
+[[nodiscard]] std::error_code receive_runtime_messages(RuntimeChannel& runtime_channel,
+                                                       EventDispatcher& events,
+                                                       bool& handshake_received) {
+  // Drain only what is immediately queued. A second handshake is invalid in the
+  // current session-level protocol and closes the instrumentation channel.
+  while (runtime_channel.supervisor_descriptor() >= 0) {
+    const auto received = runtime_channel.receive();
+    switch (received.status) {
+      case RuntimeReceiveStatus::handshake:
+        if (handshake_received) {
+          return std::make_error_code(std::errc::protocol_error);
+        }
+        handshake_received = true;
+        events.send(ProcessEventType::runtime_handshake);
+        break;
+      case RuntimeReceiveStatus::would_block:
+        return {};
+      case RuntimeReceiveStatus::closed:
+        runtime_channel.close_supervisor_end();
+        return {};
+      case RuntimeReceiveStatus::error:
+        return received.error;
+    }
+  }
+  return {};
+}
 
 struct ChildPollResult {
   int wait_status = 0;
@@ -263,10 +332,16 @@ struct ChildPollResult {
 [[nodiscard]] CaptureResult capture_output_and_wait(const pid_t child,
                                                     Pipe& standard_output,
                                                     Pipe& standard_error,
+                                                    RuntimeChannel& runtime_channel,
                                                     const int signal_descriptor,
                                                     EventDispatcher& events) {
+  // stdout, stderr, signals, runtime packets, and child completion must progress
+  // together. Polling avoids the classic deadlock where a child fills one pipe
+  // while the parent blocks reading or waiting on something else.
   constexpr std::size_t stream_count = 2U;
-  constexpr std::size_t descriptor_count = stream_count + 1U;
+  constexpr std::size_t signal_descriptor_index = stream_count;
+  constexpr std::size_t runtime_descriptor_index = stream_count + 1U;
+  constexpr std::size_t descriptor_count = stream_count + 2U;
   constexpr int child_poll_interval_milliseconds = 50;
   std::array<MonitoredStream, stream_count> streams{
       MonitoredStream{&standard_output, ProcessEventType::standard_output},
@@ -275,6 +350,7 @@ struct ChildPollResult {
   CaptureResult result;
   std::size_t first_stream = 0U;
   bool child_reaped = false;
+  bool runtime_handshake_received = false;
 
   while (!child_reaped) {
     if (const auto error = forward_pending_signals(signal_descriptor, events, child)) {
@@ -298,8 +374,10 @@ struct ChildPollResult {
       descriptors[index].fd = streams[index].pipe->read_descriptor();
       descriptors[index].events = POLLIN;
     }
-    descriptors[stream_count].fd = signal_descriptor;
-    descriptors[stream_count].events = POLLIN;
+    descriptors[signal_descriptor_index].fd = signal_descriptor;
+    descriptors[signal_descriptor_index].events = POLLIN;
+    descriptors[runtime_descriptor_index].fd = runtime_channel.supervisor_descriptor();
+    descriptors[runtime_descriptor_index].events = POLLIN;
 
     int poll_result = -1;
     do {
@@ -312,15 +390,32 @@ struct ChildPollResult {
       break;
     }
 
-    if ((descriptors[stream_count].revents & POLLIN) != 0) {
+    if ((descriptors[signal_descriptor_index].revents & POLLIN) != 0) {
       if (const auto error =
               forward_pending_signals(signal_descriptor, events, child)) {
         result.signal_error = error;
         break;
       }
-    } else if (descriptors[stream_count].revents != 0) {
+    } else if (descriptors[signal_descriptor_index].revents != 0) {
       result.signal_error = std::make_error_code(std::errc::io_error);
       break;
+    }
+
+    const auto runtime_events = descriptors[runtime_descriptor_index].revents;
+    if (runtime_events != 0 && runtime_channel.supervisor_descriptor() >= 0) {
+      if ((runtime_events & POLLNVAL) != 0) {
+        result.runtime_error = std::make_error_code(std::errc::bad_file_descriptor);
+        runtime_channel.close_supervisor_end();
+      } else if ((runtime_events & (POLLIN | POLLHUP)) != 0) {
+        if (const auto error = receive_runtime_messages(runtime_channel, events,
+                                                        runtime_handshake_received)) {
+          result.runtime_error = error;
+          runtime_channel.close_supervisor_end();
+        }
+      } else {
+        result.runtime_error = std::make_error_code(std::errc::io_error);
+        runtime_channel.close_supervisor_end();
+      }
     }
 
     const auto poll_first_stream = first_stream;
@@ -429,9 +524,18 @@ struct ChildPollResult {
       }
       monitored.pipe->close_read_end();
     }
+
+    if (runtime_channel.supervisor_descriptor() >= 0) {
+      if (const auto error = receive_runtime_messages(runtime_channel, events,
+                                                      runtime_handshake_received)) {
+        result.runtime_error = error;
+      }
+      runtime_channel.close_supervisor_end();
+    }
   } else {
     standard_output.close_read_end();
     standard_error.close_read_end();
+    runtime_channel.close_supervisor_end();
   }
 
   if (!child_reaped && !result.wait_error) {
@@ -446,6 +550,8 @@ struct ChildPollResult {
 ProcessResult execute(const std::span<const std::string_view> arguments,
                       const ProcessEventHandler& event_handler,
                       const ExecuteOptions& options) {
+  // Anything requiring allocation or C++ containers is prepared before fork.
+  // The child then follows a small, allocation-free path into execvpe.
   if (arguments.empty() ||
       std::any_of(arguments.begin(), arguments.end(),
                   [](const auto argument) {
@@ -483,6 +589,15 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
   if (const auto error = Pipe::create(standard_error)) {
     return {.state = ProcessState::supervisor_failed, .error = error};
   }
+  RuntimeChannel runtime_channel;
+  if (const auto error = RuntimeChannel::create(runtime_channel)) {
+    return {.state = ProcessState::supervisor_failed, .error = error};
+  }
+
+  std::vector<std::string> owned_environment;
+  std::vector<char*> environment_pointers;
+  build_target_environment(runtime_channel.target_descriptor(), owned_environment,
+                           environment_pointers);
 
   ForwardedSignals forwarded_signals;
   if (const auto error = forwarded_signals.start()) {
@@ -498,6 +613,7 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     launch_errors.close_read_end();
     standard_output.close_read_end();
     standard_error.close_read_end();
+    runtime_channel.close_supervisor_end();
 
     if (::setpgid(0, 0) < 0) {
       send_launch_error(launch_errors.write_descriptor(), errno);
@@ -528,7 +644,13 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
 
     standard_output.close_write_end();
     standard_error.close_write_end();
-    ::execvp(argument_pointers.front(), argument_pointers.data());
+    if (const int error = runtime_channel.make_target_descriptor_inheritable();
+        error != 0) {
+      send_launch_error(launch_errors.write_descriptor(), error);
+      ::_exit(127);
+    }
+    ::execvpe(argument_pointers.front(), argument_pointers.data(),
+              environment_pointers.data());
 
     const int launch_error = errno;
     send_launch_error(launch_errors.write_descriptor(), launch_error);
@@ -538,6 +660,7 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
   launch_errors.close_write_end();
   standard_output.close_write_end();
   standard_error.close_write_end();
+  runtime_channel.close_target_end();
 
   EventDispatcher events{static_cast<int>(child), event_handler};
   events.send(ProcessEventType::started);
@@ -552,8 +675,9 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     events.send(ProcessEventType::launch_failed, launch_error.error_number);
   }
 
-  const auto capture = capture_output_and_wait(child, standard_output, standard_error,
-                                               forwarded_signals.descriptor(), events);
+  const auto capture =
+      capture_output_and_wait(child, standard_output, standard_error, runtime_channel,
+                              forwarded_signals.descriptor(), events);
 
   const auto signal_restore_error = forwarded_signals.restore_mask();
 
@@ -607,6 +731,11 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
   if (WIFEXITED(capture.wait_status)) {
     const auto exit_code = WEXITSTATUS(capture.wait_status);
     events.send(ProcessEventType::exited, exit_code);
+    if (capture.runtime_error) {
+      return {.state = ProcessState::supervisor_failed,
+              .process_id = static_cast<int>(child),
+              .error = capture.runtime_error};
+    }
     if (events.error()) {
       return {.state = ProcessState::supervisor_failed,
               .process_id = static_cast<int>(child),
@@ -620,6 +749,11 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
   if (WIFSIGNALED(capture.wait_status)) {
     const auto signal_number = WTERMSIG(capture.wait_status);
     events.send(ProcessEventType::signaled, signal_number);
+    if (capture.runtime_error) {
+      return {.state = ProcessState::supervisor_failed,
+              .process_id = static_cast<int>(child),
+              .error = capture.runtime_error};
+    }
     if (events.error()) {
       return {.state = ProcessState::supervisor_failed,
               .process_id = static_cast<int>(child),

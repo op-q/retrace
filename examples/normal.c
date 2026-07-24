@@ -1,3 +1,7 @@
+// Small successful target for manual demos and CTest. It writes to both streams
+// and checks every stdio operation so fixture failure is never mistaken for
+// successful recording.
+
 #include <stdio.h>
 #include <stdlib.h>
 

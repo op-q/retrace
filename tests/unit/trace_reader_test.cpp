@@ -1,3 +1,6 @@
+// Reader hardening tests built from independently encoded byte vectors. This
+// avoids using Writer as the test oracle and exercises every truncation boundary.
+
 #include <unistd.h>
 
 #include <algorithm>
@@ -365,6 +368,16 @@ void test_distinguishes_truncation_and_malformed_frames(TestContext& test) {
   test.expect(reader.next(event).error == retrace::trace::make_error_code(
                                               retrace::trace::TraceErrc::invalid_event),
               "signal-receive requires a u32 payload");
+
+  auto bad_runtime_handshake_payload = golden_header();
+  append_frame(bad_runtime_handshake_payload,
+               static_cast<std::uint16_t>(retrace::trace::EventType::runtime_handshake),
+               1U, {1U});
+  test.expect(!open_bytes(bad_runtime_handshake_payload, reader),
+              "a bad runtime-handshake trace opens");
+  test.expect(reader.next(event).error == retrace::trace::make_error_code(
+                                              retrace::trace::TraceErrc::invalid_event),
+              "runtime-handshake requires an empty payload");
 
   auto partial_payload = golden_header();
   append_frame(partial_payload, 60000U, 1U, {1U, 2U});

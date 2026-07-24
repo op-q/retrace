@@ -32,4 +32,11 @@ this repository.
 - Preserve the C17/C++20 boundary described in `docs/architecture.md`.
 - Explain relevant C or C++ concepts while implementing them so the repository
   remains useful as a learning project.
+- Start every new comment-capable source, header, test, script, build, and
+  configuration file with a short summary of the file's overall purpose. Put
+  it at the first legal comment position, after a shebang when one is required.
+- Add focused comments for ownership, data flow, safety constraints, and other
+  non-obvious decisions. Explain why the code exists without narrating trivial
+  syntax. Formats that do not support comments, such as standard JSON, are
+  exempt.
 - Keep support claims aligned with implemented and tested behavior.

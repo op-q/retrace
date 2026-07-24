@@ -1,3 +1,4 @@
+# Structured public bug reports require redaction and a synthetic reproduction.
 name: Bug report
 description: Report reproducible behavior that does not match the documentation
 title: "bug: "

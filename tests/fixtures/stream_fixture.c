@@ -1,3 +1,7 @@
+// Deterministic stdout/stderr target used by process integration tests. Small
+// output checks routing; large output exceeds a typical pipe and checks that the
+// supervisor drains both streams concurrently.
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

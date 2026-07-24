@@ -1,3 +1,6 @@
+// Streaming trace decoder for untrusted files. Every stored length is bounded
+// before allocation, and complete frames are returned one at a time.
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -112,6 +115,8 @@ struct ExactRead {
 
 [[nodiscard]] ExactRead read_exact(const int descriptor, void* destination,
                                    const std::size_t size) {
+  // EOF is not automatically an error: callers decide whether it marks a clean
+  // boundary or a recoverable incomplete final frame.
   auto* bytes = static_cast<std::byte*>(destination);
   ExactRead result;
   while (result.bytes_read < size) {
@@ -133,6 +138,8 @@ struct ExactRead {
   return result;
 }
 
+// Checked cursor arithmetic centralizes all bounds checks for the variable
+// header payload and prevents offset wraparound or over-read.
 class HeaderCursor final {
  public:
   explicit HeaderCursor(const std::span<const std::byte> bytes) : bytes_(bytes) {}
@@ -185,6 +192,7 @@ class HeaderCursor final {
     case EventType::process_signal:
     case EventType::process_launch_failure:
     case EventType::signal_receive:
+    case EventType::runtime_handshake:
       return true;
   }
   return false;
@@ -198,6 +206,7 @@ class HeaderCursor final {
   switch (static_cast<EventType>(event.type)) {
     case EventType::process_start:
     case EventType::process_exec:
+    case EventType::runtime_handshake:
       return event.payload.empty();
     case EventType::standard_output:
     case EventType::standard_error:
@@ -245,6 +254,8 @@ Reader& Reader::operator=(Reader&& other) noexcept {
 }
 
 std::error_code Reader::open(const std::filesystem::path& path, Reader& result) {
+  // Open into a temporary candidate. `result` changes only after every fixed and
+  // variable header field has passed validation.
   if (path.empty() || path.native().find('\0') != std::string::npos) {
     return std::make_error_code(std::errc::invalid_argument);
   }
@@ -338,6 +349,8 @@ std::error_code Reader::open(const std::filesystem::path& path, Reader& result) 
 }
 
 EventReadResult Reader::next(Event& result) {
+  // The 4-byte frame length is read first. EOF there is clean; EOF anywhere
+  // after it means the final frame was interrupted and earlier frames survive.
   if (terminal_) {
     return terminal_result_;
   }

@@ -17,7 +17,8 @@ program because RETRACE will own many resources and coordinate complex states.
 
 The root CMake project enables both `C17` and `C++20`. Small C fixtures under
 `tests/` and recorder demonstrations under `examples/` exercise the C toolchain.
-The injected C runtime remains deferred until the process recorder is complete.
+The injected C runtime now implements its first bounded handshake slices after
+completion of the process-recorder implementation.
 
 ## Lesson 2: compilation and linking
 
@@ -106,30 +107,32 @@ Copying is deleted because two owners would both try to close the same integer.
 Moving transfers the descriptor and changes the previous owner to `-1`. This is
 the difference between an owning handle and a borrowed integer.
 
-## Lesson 7: `fork`, `execvp`, and `waitpid`
+## Lesson 7: `fork`, `execvpe`, and `waitpid`
 
 The first `run` implementation combines three Linux C APIs:
 
 ```text
 RETRACE parent
    │
-   ├── fork() ──> child calls execvp() ──> target program
+   ├── fork() ──> child calls execvpe() ──> target program
    │
    └── waitpid() <──────────────────────── target completion
 ```
 
 `fork()` returns twice: once in the parent with the child's process ID, and once
-in the child with zero. `execvp()` does not create another process; on success,
+in the child with zero. `execvpe()` does not create another process; on success,
 it replaces the child program and never returns. `waitpid()` lets the parent
 collect the child's final status instead of leaving a zombie process.
 
-The `p` in `execvp` asks libc to search `PATH`, which is why both `/bin/echo` and
-`python3` work as targets. The argument list must be a mutable, NUL-terminated
-array of `char*`, ending with a null pointer. RETRACE copies its non-owning
-`string_view` inputs into owned `std::string` storage before building that C ABI
-array.
+The `p` in `execvpe` asks libc to search `PATH`, which is why both `/bin/echo`
+and `python3` work as targets. The `e` supplies an explicit environment array.
+RETRACE copies that environment before `fork()`, replaces its private runtime
+descriptor setting, and builds both mutable, NUL-terminated `char*` arrays in
+the parent. This avoids allocation-heavy environment mutation between `fork()`
+and `exec`, where the child should perform only a small set of predictable
+operations.
 
-One close-on-exec pipe reports launch errors. A successful `execvp()` closes the
+One close-on-exec pipe reports launch errors. A successful `execvpe()` closes the
 pipe automatically; a failed call writes its saved `errno`. This distinguishes
 “the target returned 127” from “the target could not be launched.”
 
@@ -225,7 +228,7 @@ that the recording was finalized or authenticated.
 ## Lesson 11: process groups, signals, and `chdir`
 
 A process group gives one identifier to a related set of processes. The target
-child calls `setpgid(0, 0)` before `execvp()`, making its PID the group ID.
+child calls `setpgid(0, 0)` before `execvpe()`, making its PID the group ID.
 RETRACE can then send a signal to the whole group with a negative identifier:
 
 ```c
@@ -271,7 +274,27 @@ on the build rather than its documented contract.
 target. `MSG_DONTWAIT` prevents a full channel from blocking target startup.
 Every failure is ignored after restoring the `errno` value that existed on
 entry. This is deliberate fail-open instrumentation: losing observability is
-reported by the future supervisor, but it does not become a new target failure.
+reported by the supervisor, but it does not become a new target failure.
+
+## Lesson 13: sequenced packets and descriptor inheritance
+
+A Unix-domain `SOCK_SEQPACKET` pair is local IPC with message boundaries. Unlike
+a byte-stream pipe, one runtime `send()` corresponds to one supervisor
+`recvmsg()`. That makes it possible to reject a short, oversized, or
+size-mismatched frame without guessing where the next message begins.
+
+Both endpoints start nonblocking and close-on-exec. RAII owns them before
+`fork()`. The child closes the supervisor endpoint and clears close-on-exec only
+on the target endpoint; the parent does the inverse. The rebuilt environment
+names that one inherited descriptor. This is capability-like design: possession
+of the descriptor, rather than a global pathname or listening service, grants
+access to the session channel.
+
+The supervisor polls the channel beside stdout, stderr, and signals. It accepts
+one compatible handshake, emits typed evidence, and rejects malformed or
+duplicate packets. Once the direct target exits, it drains only immediately
+available messages and closes the channel so a descendant cannot keep
+supervision alive indefinitely.
 
 ## Habits to practice now
 

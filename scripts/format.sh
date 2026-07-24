@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Format every tracked or unignored C/C++ source. `--check` is non-mutating and
+# is the mode used by CI; no argument applies clang-format in place.
 set -euo pipefail
 
 script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -20,6 +22,7 @@ if (($# > 0)); then
 fi
 
 mapfile -d '' source_files < <(
+  # NUL delimiters preserve unusual but valid filenames.
   git ls-files --cached --others --exclude-standard -z -- \
     '*.c' '*.h' '*.cpp' '*.hpp'
 )

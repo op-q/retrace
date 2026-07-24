@@ -1,5 +1,8 @@
 #pragma once
 
+// Internal command handlers for reading traces. They are separated from
+// commands.cpp so trace inspection/validation can evolve independently.
+
 #include <iosfwd>
 #include <span>
 #include <string_view>

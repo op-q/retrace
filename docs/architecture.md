@@ -8,7 +8,9 @@ metadata and observed lifecycle and stream events to a versioned trace. Each
 target leads a process group; RETRACE synchronously receives `SIGINT` and
 `SIGTERM`, forwards them to that group, and records successful forwarding. It can
 also validate a trace's v1.0 structure and render its complete events as a
-terminal timeline. Trace export and fault injection are not yet implemented.
+terminal timeline. Every run creates and validates a runtime event channel, but
+RETRACE does not yet load the runtime automatically or interpose libc
+operations. Trace export and fault injection are not yet implemented.
 
 The target architecture will supervise the command, record selected runtime
 events, and write them to a trace. Later it will reproduce explicitly configured
@@ -46,8 +48,10 @@ close-on-exec pipes, synchronous signal forwarding, concurrent stream
 collection, typed lifecycle events, and waiting. It distinguishes a launch
 failure from a target that exits with status 127 and preserves normal exit and
 signal status. A bounded buffer feeds events to a callback instead of
-accumulating all target output in memory. The planned supervisor will also own
-runtime-event collection. It must state whether a usable partial trace exists.
+accumulating all target output in memory. The supervisor now also creates a
+bounded sequenced-packet channel, passes only the target endpoint across
+`exec`, validates the versioned handshake, and translates it into a typed
+event. It must state whether a usable partial trace exists.
 
 Child status is checked while the stream pipes are polled. Once the direct child
 is reaped, the collector snapshots and drains only bytes already queued in each
@@ -59,13 +63,16 @@ RETRACE still waits for and reports only the direct target.
 The current launch sequence is:
 
 1. Parse the command and validate the selected working directory.
-2. Create the trace, stdout/stderr pipes, launch-status pipe, and signal source.
+2. Create the trace, stdout/stderr pipes, launch-status pipe, runtime channel,
+   and signal source.
 3. Call `fork()`.
 4. In the child, create the target process group, restore the inherited signal
-   mask, change directory, redirect descriptors, and call `execvp()`.
+   mask, change directory, redirect descriptors, make the target runtime
+   endpoint inheritable, and call `execvpe()` with an explicitly rebuilt
+   environment.
 5. In the parent, close unused pipe ends, record `process.start`, poll streams
-   and the signal source, forward signals with `kill(-pgid, signal)`, and check
-   completion with `waitpid()`.
+   with the runtime and signal sources, validate any handshake, forward signals
+   with `kill(-pgid, signal)`, and check completion with `waitpid()`.
 6. Finish all complete frame writes and close the trace. Version 1.0 has no
    footer or durable-finalization record.
 
@@ -75,10 +82,15 @@ tracking remain later work. Linux subreaper behavior may be evaluated later.
 
 ### Injected runtime
 
-The first v0.2 slice builds a deliberately small C shared library. Its
-constructor can emit a versioned handshake over an explicitly configured
-Unix-domain sequenced-packet socket. Missing, malformed, or closed channels are
-nonfatal. The supervisor does not load the library yet.
+The current v0.2 slices build a deliberately small C shared library and a
+supervisor-owned Unix-domain sequenced-packet channel. The target environment
+replaces any caller-provided `RETRACE_RUNTIME_EVENT_FD` value with the intended
+inherited endpoint. If a target independently loads the runtime, its constructor
+emits a versioned handshake; the supervisor validates the complete packet and
+records `runtime.handshake`. Missing, malformed, or closed channels remain
+nonfatal inside the runtime. A malformed packet is a supervisor protocol error,
+but RETRACE still reaps the direct target and can retain observed lifecycle
+evidence. Automatic library loading is not implemented yet.
 
 The completed runtime will be loaded into dynamically linked targets through
 `LD_PRELOAD`. It will:

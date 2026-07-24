@@ -1,3 +1,6 @@
+// Intentional signal-termination target. It emits one diagnostic, flushes it,
+// and raises SIGSEGV through a defined C API so RETRACE can record the outcome.
+
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>

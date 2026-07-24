@@ -1,3 +1,4 @@
+# Editor defaults for text files not handled by clang-format.
 root = true
 
 [*]

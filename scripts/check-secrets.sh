@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Repository guardrail, not a full secret scanner. It rejects dangerous file
+# names and a small set of high-confidence credential shapes before publication.
 set -euo pipefail
 
 script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -6,6 +8,7 @@ project_root=$(CDPATH= cd -- "${script_directory}/.." && pwd)
 cd "${project_root}"
 
 mapfile -d '' candidate_files < <(
+  # Include untracked, non-ignored files so a new secret is caught before `git add`.
   git ls-files --cached --others --exclude-standard -z
 )
 

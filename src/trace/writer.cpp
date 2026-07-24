@@ -1,3 +1,6 @@
+// Append-only trace encoder. It writes explicit little-endian fields and closes
+// permanently after the first write error so a corrupt middle cannot be hidden.
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -123,6 +126,8 @@ void append_u64(std::vector<std::byte>& destination, const std::uint64_t value) 
 
 [[nodiscard]] std::error_code write_all(const int descriptor, const void* data,
                                         const std::size_t size) {
+  // write(2) may complete partially or be interrupted. This loop advances only
+  // by bytes the kernel confirmed, preserving exact frame boundaries.
   const auto* bytes = static_cast<const std::byte*>(data);
   std::size_t bytes_written = 0U;
   while (bytes_written < size) {
@@ -201,6 +206,8 @@ Writer& Writer::operator=(Writer&& other) noexcept {
 
 CreationResult Writer::create(const std::filesystem::path& path,
                               const Metadata& metadata, Writer& result) {
+  // Metadata is fully encoded and checked before opening the destination. Once
+  // created, the file is exclusive, user-only, and never overwritten.
   if (path.empty() || path.native().find('\0') != std::string::npos) {
     return {.error = std::make_error_code(std::errc::invalid_argument)};
   }
@@ -246,6 +253,8 @@ CreationResult Writer::create(const std::filesystem::path& path,
 std::error_code Writer::write_event(const EventType type,
                                     const std::uint32_t process_id,
                                     const std::string_view payload) {
+  // Event schemas are checked here as well as by the reader. A writer bug should
+  // not be able to create bytes that its matching reader rejects.
   if (!is_open()) {
     return std::make_error_code(std::errc::bad_file_descriptor);
   }
@@ -256,6 +265,7 @@ std::error_code Writer::write_event(const EventType type,
   switch (type) {
     case EventType::process_start:
     case EventType::process_exec:
+    case EventType::runtime_handshake:
       if (!payload.empty()) {
         return std::make_error_code(std::errc::invalid_argument);
       }

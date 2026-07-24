@@ -1,3 +1,4 @@
+# Keep pinned GitHub Action revisions current through small automated PRs.
 version: 2
 updates:
   - package-ecosystem: github-actions

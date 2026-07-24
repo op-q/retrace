@@ -73,7 +73,10 @@ selected working directories are preserved, both forwarded signals reach the
 target group, and the caller's original signal mask is restored. CTest also runs
 the normal and intentional-crash examples through the CLI in unsanitized builds;
 sanitizer builds omit the deliberate crash while retaining signal integration
-coverage.
+coverage. Runtime-channel integration tests load the real C library after
+`exec`, require exactly one handshake, confirm a target may ignore the channel,
+and reject malformed magic, versions, flags, types, sizes, short packets,
+oversized packets, and duplicate handshakes while still observing target exit.
 
 As features land, unit tests will cover duration, signal, and rule parsing; path
 matching; encoding and decoding; format bounds; rendering; and corrupt payloads.
