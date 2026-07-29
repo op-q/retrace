@@ -117,14 +117,15 @@ endianness can differ.
 | 6 | `process.signal` | `u32` signal number |
 | 7 | `process.launch_failure` | `u32` saved `errno` |
 | 8 | `signal.receive` | `u32` signal number |
+| 9 | `runtime.handshake` | empty |
 
 `process.start` records the child created by `fork()`. `process.exec` is emitted
 when the close-on-exec launch-status pipe reaches EOF without reporting an
-`execvp()` error. A reported `execvp()` failure instead produces
+`execvpe()` error. A reported `execvpe()` failure instead produces
 `process.launch_failure`, so it cannot be confused with a target that exits with
 status 127. The EOF observation normally follows successful process-image
 replacement, but it cannot prove that the child reached target program entry:
-an unusual child termination before `execvp()` can also close the pipe without
+an unusual child termination before `execvpe()` can also close the pipe without
 an error payload.
 
 Chunk timestamps record supervisor observation order. Separate stdout and stderr
@@ -135,6 +136,11 @@ between streams when both are already readable.
 successfully forwarded to the target process group. It is distinct from
 `process.signal`, which records that the direct target was ultimately terminated
 by a signal. A target may handle a forwarded signal and exit normally.
+
+`runtime.handshake` records that the supervisor received and validated one
+version-compatible handshake packet from the target's runtime channel. It proves
+that a sender reached the handshake protocol; it does not prove that later
+interposition hooks are installed or that every operation is visible.
 
 ## Planned event extensions
 
@@ -190,10 +196,10 @@ arithmetic for every metadata field, and rejects unconsumed header bytes.
 
 For each event it checks the bounded frame length before allocating, verifies
 the redundant payload length and zero flags, and requires nondecreasing
-timestamps. It also enforces the v1.0 payload schemas: `process.start` and
-`process.exec` are empty, stream chunks contain arbitrary bounded bytes, and
-exit, signal, launch-failure, and signal-receive payloads are exactly one
-little-endian `u32`.
+timestamps. It also enforces the v1.0 payload schemas: `process.start`,
+`process.exec`, and `runtime.handshake` are empty, stream chunks contain
+arbitrary bounded bytes, and exit, signal, launch-failure, and signal-receive
+payloads are exactly one little-endian `u32`.
 Unknown event identifiers remain valid when their surrounding frame is valid;
 the reader exposes their type, thread ID, and opaque bounded payload without
 assigning semantics.

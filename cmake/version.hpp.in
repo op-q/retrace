@@ -1,5 +1,7 @@
 #pragma once
 
+// Configured by CMake into build/<preset>/generated/retrace/version.hpp.
+
 #include <string_view>
 
 namespace retrace {

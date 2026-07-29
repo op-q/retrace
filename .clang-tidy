@@ -1,3 +1,5 @@
+# Static-analysis policy: broad bug, analyzer, performance, portability, and
+# selected readability checks, restricted to project-owned headers.
 Checks: >
   -*,
   bugprone-*,

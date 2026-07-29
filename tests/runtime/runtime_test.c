@@ -1,3 +1,7 @@
+// Standalone C tests for the injected runtime constructor. Each case runs in a
+// child because a shared-library constructor normally executes once per load
+// and because closed/full socket behavior must not terminate the test runner.
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <dlfcn.h>

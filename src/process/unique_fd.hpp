@@ -1,5 +1,8 @@
 #pragma once
 
+// Minimal RAII owner for a Linux file descriptor. Copying is forbidden because
+// two owners would double-close; moving transfers the integer and its lifetime.
+
 #include <unistd.h>
 
 #include <utility>
@@ -32,6 +35,8 @@ class UniqueFd final {
   [[nodiscard]] int release() noexcept { return std::exchange(descriptor_, -1); }
 
   void reset(const int replacement = -1) noexcept {
+    // close(2) errors cannot be usefully reported from a destructor. Operations
+    // needing an observed close result use a higher-level explicit finish API.
     if (descriptor_ >= 0) {
       ::close(descriptor_);
     }

@@ -1,3 +1,6 @@
+# Build the injected runtime as a hidden-symbol C17 shared library. Keeping it
+# separate from retrace_core prevents the C++ runtime from entering the target.
+
 add_library(retrace_runtime SHARED runtime.c)
 
 target_include_directories(

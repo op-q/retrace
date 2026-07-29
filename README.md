@@ -27,13 +27,17 @@ RETRACE is pre-alpha but has a working process-recording and inspection slice:
   unknown event types;
 - `retrace validate TRACE` checks the v1.0 structure without loading the whole
   event stream into memory; and
-- dependency-free tests exercise the CLI, process and trace layers, and a C
-  stream fixture.
+- each run creates a bounded Unix-domain runtime channel, replaces any
+  caller-provided channel descriptor, and records a validated
+  `runtime.handshake` when a target independently loads the runtime; and
+- dependency-free tests exercise the CLI, process and trace layers, plus C
+  stream and runtime fixtures.
 
-Time limits, trace export, runtime instrumentation, and fault injection are not
-implemented yet. A successful validation means that the bytes are structurally
-valid v1.0; because v1.0 has no footer or checksum, it does not prove that a run
-was finalized or that its contents are authentic.
+Automatic runtime loading, libc-operation instrumentation, time limits, trace
+export, and fault injection are not implemented yet. A successful validation
+means that the bytes are structurally valid v1.0; because v1.0 has no footer or
+checksum, it does not prove that a run was finalized or that its contents are
+authentic.
 
 RETRACE is open source under the [MIT License](LICENSE).
 
@@ -55,9 +59,10 @@ Recorded traces can be inspected or structurally validated:
 ./build/dev/bin/retrace validate /tmp/example.rtc
 ```
 
-The v0.1 process-recorder slice is implemented. Development has begun on the
-v0.2 injected runtime with a standalone C17 library and versioned handshake;
-`retrace run` does not load or consume that runtime yet.
+The v0.1 process-recorder slice is implemented. The v0.2 work now includes a
+standalone C17 library, versioned handshake, and a supervisor-owned channel that
+validates and records the handshake. `retrace run` does not yet load the runtime
+into targets automatically.
 
 Later releases will add a small C runtime loaded with `LD_PRELOAD` so selected
 libc operations can be observed and controlled:

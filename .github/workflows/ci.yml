@@ -1,3 +1,5 @@
+# Pull-request and branch validation: repository hygiene, static analysis,
+# GCC/Clang builds, regular tests, and supported sanitizers.
 name: CI
 
 on:
@@ -12,6 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Fast policy checks run separately so failures are easy to classify.
   repository-safety:
     name: Repository safety
     runs-on: ubuntu-24.04
@@ -50,6 +53,7 @@ jobs:
           mapfile -t sources < <(git ls-files '*.cpp' 'runtime/*.c')
           clang-tidy --warnings-as-errors='*' -p build/ci "${sources[@]}"
 
+  # The same warnings-as-errors preset is compiled by both supported toolchains.
   build-and-test:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
@@ -81,6 +85,7 @@ jobs:
       - name: Test
         run: ctest --preset ci
 
+  # Deliberate crash tests are excluded by CMake in sanitizer mode.
   sanitizers:
     name: ASan and UBSan
     runs-on: ubuntu-24.04

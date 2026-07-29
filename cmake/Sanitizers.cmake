@@ -1,3 +1,6 @@
+# Attach the requested sanitizer to both compilation and linking for one target.
+# A cache string (rather than several booleans) makes incompatible modes explicit.
+
 function(retrace_enable_sanitizers target sanitizer)
   if(sanitizer STREQUAL "none")
     return()

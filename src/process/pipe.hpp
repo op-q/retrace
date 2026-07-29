@@ -1,5 +1,8 @@
 #pragma once
 
+// Move-only owner for both ends of a close-on-exec pipe. It also protects
+// callers whose stdin/stdout/stderr were already closed by moving new ends > 2.
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -23,6 +26,8 @@ class Pipe final {
   Pipe& operator=(Pipe&&) noexcept = default;
 
   [[nodiscard]] static std::error_code create(Pipe& result) {
+    // O_CLOEXEC prevents a successful target exec from accidentally retaining
+    // RETRACE's internal pipe endpoints.
     std::array<int, 2> descriptors{};
     if (::pipe2(descriptors.data(), O_CLOEXEC) < 0) {
       return {errno, std::generic_category()};

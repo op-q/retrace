@@ -1,3 +1,6 @@
+// Writer compatibility and failure tests. The cases inspect encoded bytes
+// directly so accidental changes to the v1.0 layout cannot hide behind Reader.
+
 #include "retrace/trace.hpp"
 
 #include <sys/stat.h>
@@ -355,6 +358,9 @@ void test_event_schema_validation(TestContext& test) {
     test.expect(writer.write_event(retrace::trace::EventType::process_exec, 7U,
                                    "unexpected") == invalid_argument,
                 "process-exec rejects a payload");
+    test.expect(writer.write_event(retrace::trace::EventType::runtime_handshake, 7U,
+                                   "unexpected") == invalid_argument,
+                "runtime-handshake rejects a payload");
     test.expect(writer.write_event(retrace::trace::EventType::process_exit, 7U) ==
                     invalid_argument,
                 "process-exit rejects an empty value payload");
@@ -377,6 +383,8 @@ void test_event_schema_validation(TestContext& test) {
 
     test.expect(!writer.write_event(retrace::trace::EventType::standard_output, 7U),
                 "a stream event permits an empty byte payload");
+    test.expect(!writer.write_event(retrace::trace::EventType::runtime_handshake, 7U),
+                "a runtime handshake permits its required empty payload");
     test.expect(
         !writer.write_value_event(retrace::trace::EventType::process_signal, 7U, 9U),
         "write_value_event accepts a value-bearing event type");
@@ -386,7 +394,7 @@ void test_event_schema_validation(TestContext& test) {
   }
 
   const auto bytes = read_file(path.value());
-  test.expect(count_complete_frames(bytes) == 3U,
+  test.expect(count_complete_frames(bytes) == 4U,
               "rejected event shapes append no frames");
 }
 

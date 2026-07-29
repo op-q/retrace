@@ -1,3 +1,4 @@
+# Shared mechanical style for every C17 and C++20 source file.
 BasedOnStyle: Google
 Standard: c++20
 ColumnLimit: 88

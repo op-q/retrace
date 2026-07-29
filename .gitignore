@@ -1,3 +1,5 @@
+# Local-only output, editor state, secrets, traces, and crash artifacts.
+
 # Build products
 /build/
 /build-*/

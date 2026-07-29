@@ -1,3 +1,6 @@
+// Process-group fixture for SIGINT/SIGTERM forwarding tests. It can create a
+// child so the test proves a group-directed signal reaches more than one PID.
+
 #define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>

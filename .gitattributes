@@ -1,3 +1,4 @@
+# Normalize repository text while keeping binary trace fixtures opaque to Git.
 * text=auto eol=lf
 
 *.c text diff=cpp

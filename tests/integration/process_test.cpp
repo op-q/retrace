@@ -1,19 +1,26 @@
+// End-to-end tests for the Linux supervisor: fork/exec status, process groups,
+// signals, working directories, stream draining, runtime IPC, and error priority.
+
 #include "retrace/process.hpp"
 
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <charconv>
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#include "retrace/runtime_protocol.h"
 
 #ifndef RETRACE_STREAM_FIXTURE_PATH
 #error "RETRACE_STREAM_FIXTURE_PATH must name the stream fixture executable"
@@ -21,6 +28,10 @@
 
 #ifndef RETRACE_SIGNAL_FIXTURE_PATH
 #error "RETRACE_SIGNAL_FIXTURE_PATH must name the signal fixture executable"
+#endif
+
+#ifndef RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH
+#error "RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH must name the runtime channel fixture"
 #endif
 
 namespace {
@@ -62,6 +73,39 @@ class TemporaryDirectory final {
 
  private:
   std::string path_;
+};
+
+class ScopedRuntimeEnvironment final {
+ public:
+  explicit ScopedRuntimeEnvironment(const std::string_view value) {
+    if (const char* const previous = ::getenv(RETRACE_RUNTIME_EVENT_FD_ENV);
+        previous != nullptr) {
+      previous_value_ = previous;
+    }
+    configured_ =
+        ::setenv(RETRACE_RUNTIME_EVENT_FD_ENV, std::string{value}.c_str(), 1) == 0;
+  }
+
+  ~ScopedRuntimeEnvironment() {
+    if (!configured_) {
+      return;
+    }
+    if (previous_value_) {
+      [[maybe_unused]] const auto result =
+          ::setenv(RETRACE_RUNTIME_EVENT_FD_ENV, previous_value_->c_str(), 1);
+    } else {
+      [[maybe_unused]] const auto result = ::unsetenv(RETRACE_RUNTIME_EVENT_FD_ENV);
+    }
+  }
+
+  ScopedRuntimeEnvironment(const ScopedRuntimeEnvironment&) = delete;
+  ScopedRuntimeEnvironment& operator=(const ScopedRuntimeEnvironment&) = delete;
+
+  [[nodiscard]] bool configured() const noexcept { return configured_; }
+
+ private:
+  std::optional<std::string> previous_value_;
+  bool configured_ = false;
 };
 
 struct ObservedEvent {
@@ -109,6 +153,108 @@ void test_embedded_nul_argument_is_rejected(TestContext& test) {
               "an embedded NUL reports invalid_argument");
   test.expect(result.process_id == 0,
               "invalid target bytes do not create a child process");
+}
+
+void test_runtime_handshake_is_received(TestContext& test) {
+  ScopedRuntimeEnvironment caller_environment{"caller-value-must-be-replaced"};
+  test.expect(caller_environment.configured(),
+              "the runtime environment replacement test is configured");
+  if (!caller_environment.configured()) {
+    return;
+  }
+
+  constexpr std::array arguments{std::string_view{RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH},
+                                 std::string_view{"load-runtime"}};
+  std::vector<ObservedEvent> events;
+  const auto result = retrace::process::execute(
+      arguments, [&events](const retrace::process::ProcessEvent& event) {
+        events.push_back(
+            {.type = event.type, .process_id = event.process_id, .value = event.value});
+        return std::error_code{};
+      });
+
+  const auto handshake_count =
+      std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == retrace::process::ProcessEventType::runtime_handshake;
+      });
+  const auto exec_position =
+      std::find_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == retrace::process::ProcessEventType::exec_succeeded;
+      });
+  const auto handshake_position =
+      std::find_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == retrace::process::ProcessEventType::runtime_handshake;
+      });
+  const auto exit_position =
+      std::find_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == retrace::process::ProcessEventType::exited;
+      });
+
+  test.expect(
+      result.state == retrace::process::ProcessState::exited && result.exit_code == 0,
+      "a target that loads the runtime exits normally");
+  test.expect(handshake_count == 1,
+              "the supervisor receives exactly one runtime handshake");
+  test.expect(exec_position < handshake_position && handshake_position < exit_position,
+              "the runtime handshake follows exec and precedes target exit");
+}
+
+void test_absent_runtime_handshake_is_nonfatal(TestContext& test) {
+  constexpr std::array arguments{std::string_view{RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH},
+                                 std::string_view{"no-handshake"}};
+  std::size_t handshake_count = 0U;
+  const auto result = retrace::process::execute(
+      arguments, [&handshake_count](const retrace::process::ProcessEvent& event) {
+        if (event.type == retrace::process::ProcessEventType::runtime_handshake) {
+          ++handshake_count;
+        }
+        return std::error_code{};
+      });
+
+  test.expect(
+      result.state == retrace::process::ProcessState::exited && result.exit_code == 0,
+      "a target may ignore the runtime channel");
+  test.expect(handshake_count == 0U,
+              "an ignored runtime channel creates no false handshake");
+}
+
+void test_invalid_runtime_messages_are_rejected(TestContext& test) {
+  struct InvalidCase {
+    std::string_view mode;
+    std::error_code expected_error;
+  };
+  const std::array cases{
+      InvalidCase{"bad-magic", std::make_error_code(std::errc::protocol_error)},
+      InvalidCase{"unsupported-major", std::make_error_code(std::errc::protocol_error)},
+      InvalidCase{"unsupported-minor", std::make_error_code(std::errc::protocol_error)},
+      InvalidCase{"nonzero-flags", std::make_error_code(std::errc::protocol_error)},
+      InvalidCase{"unknown-type", std::make_error_code(std::errc::protocol_error)},
+      InvalidCase{"payload-mismatch", std::make_error_code(std::errc::protocol_error)},
+      InvalidCase{"short-frame", std::make_error_code(std::errc::protocol_error)},
+      InvalidCase{"oversized", std::make_error_code(std::errc::message_size)},
+      InvalidCase{"duplicate-handshake",
+                  std::make_error_code(std::errc::protocol_error)},
+  };
+
+  for (const auto& invalid : cases) {
+    const std::array arguments{std::string_view{RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH},
+                               invalid.mode};
+    bool exit_observed = false;
+    const auto result = retrace::process::execute(
+        arguments, [&exit_observed](const retrace::process::ProcessEvent& event) {
+          if (event.type == retrace::process::ProcessEventType::exited) {
+            exit_observed = true;
+          }
+          return std::error_code{};
+        });
+
+    test.expect(result.state == retrace::process::ProcessState::supervisor_failed,
+                "an invalid runtime message fails supervision");
+    test.expect(result.error == invalid.expected_error,
+                "an invalid runtime message reports its protocol class");
+    test.expect(exit_observed,
+                "the target exit is still observed after a runtime protocol error");
+  }
 }
 
 void test_clean_exit(TestContext& test) {
@@ -535,6 +681,9 @@ int main() {
   TestContext test;
   test_empty_command_is_rejected(test);
   test_embedded_nul_argument_is_rejected(test);
+  test_runtime_handshake_is_received(test);
+  test_absent_runtime_handshake_is_nonfatal(test);
+  test_invalid_runtime_messages_are_rejected(test);
   test_clean_exit(test);
   test_nonzero_exit(test);
   test_exit_127_is_not_a_launch_failure(test);

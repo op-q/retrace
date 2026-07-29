@@ -25,7 +25,7 @@ retrace run [--output TRACE] [--working-directory PATH] -- COMMAND [ARGS...]
 ```
 
 Everything after `--` belongs to the target. RETRACE currently launches the
-command with `fork()` and `execvp()`, places it in a new process group, collects
+command with `fork()` and `execvpe()`, places it in a new process group, collects
 stdout and stderr concurrently through separate pipes, forwards them to its own
 corresponding streams, waits with `waitpid()`, and returns the target's exit
 code. `SIGINT` and `SIGTERM` received during supervision are forwarded to the
@@ -33,7 +33,7 @@ whole target group. A target killed by a signal returns the usual shell-style
 `128 + signal` status. A missing executable returns RETRACE code `5`.
 
 `--working-directory PATH` resolves an existing directory before trace creation
-or target launch. The child calls `chdir()` before `execvp()`, and the resolved
+or target launch. The child calls `chdir()` before `execvpe()`, and the resolved
 directory is stored in trace metadata. A relative `--output` path remains
 relative to RETRACE's own directory; the supervisor does not change directory.
 
@@ -41,11 +41,18 @@ Without `--output`, RETRACE only relays captured streams. With `--output TRACE`,
 it creates a new v1.0 file and records command metadata, `process.start`,
 `process.exec`, stdout/stderr chunks, successfully forwarded signals, and the
 final exit or signal. A failed
-`execvp()` is recorded separately from target exit status 127. `process.exec`
+`execvpe()` is recorded separately from target exit status 127. `process.exec`
 means that the close-on-exec launch-status pipe reached EOF without reporting an
-`execvp()` error. It normally follows a successful replacement, but cannot prove
-that the child reached target program entry because an unusual pre-`execvp()`
+`execvpe()` error. It normally follows a successful replacement, but cannot prove
+that the child reached target program entry because an unusual pre-`execvpe()`
 termination can also close the pipe.
+
+Each run also creates a nonblocking Unix-domain runtime channel and replaces any
+caller-provided `RETRACE_RUNTIME_EVENT_FD` value with its intended inherited
+endpoint. Targets may ignore it. If a target independently loads
+`libretrace_runtime.so`, a valid handshake is recorded as `runtime.handshake`.
+The CLI does not yet add `LD_PRELOAD` or otherwise load the library
+automatically.
 
 Trace creation never overwrites an existing path, does not follow a final
 symlink, uses user-only permissions, and occurs before the target starts. Parent

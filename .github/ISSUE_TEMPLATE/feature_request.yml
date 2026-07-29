@@ -1,3 +1,4 @@
+# Feature proposals start from the user problem and explicitly consider scope.
 name: Feature request
 description: Propose a focused addition that fits RETRACE's documented scope
 title: "feature: "

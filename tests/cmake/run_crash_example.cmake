@@ -1,3 +1,7 @@
+# CTest helper for an outcome that is intentionally non-zero. execute_process
+# captures the shell-style status and both streams so CTest itself can succeed
+# only when the expected crash was observed.
+
 if(NOT DEFINED RETRACE_EXECUTABLE OR NOT DEFINED CRASH_EXAMPLE_EXECUTABLE)
   message(FATAL_ERROR "retrace and crash-example executable paths are required")
 endif()

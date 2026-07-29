@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Optional local safety net: block direct publication to main/master, check the
+# commits being updated for whitespace errors, then scan the working repository.
 set -euo pipefail
 
 hook_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -6,6 +8,8 @@ project_root=$(CDPATH= cd -- "${hook_directory}/.." && pwd)
 cd "${project_root}"
 
 while read -r local_ref local_revision remote_ref remote_revision; do
+  # Git supplies one ref update per line on stdin. All-zero revisions represent
+  # branch creation/deletion and cannot form an ordinary old..new diff.
   if [[ "${remote_ref}" == "refs/heads/main" ||
         "${remote_ref}" == "refs/heads/master" ]]; then
     echo "error: direct pushes to ${remote_ref#refs/heads/} are blocked" >&2

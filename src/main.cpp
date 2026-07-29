@@ -1,3 +1,6 @@
+// Thin executable entry point. All command behavior lives in retrace::cli::run
+// so tests can call the same code with in-memory input/output streams.
+
 #include <cstddef>
 #include <iostream>
 #include <string_view>

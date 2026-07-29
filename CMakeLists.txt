@@ -1,3 +1,6 @@
+# Top-level build graph: configure language/tooling policy, build the reusable
+# C++ core and CLI, then add the injected C runtime, examples, and tests.
+
 cmake_minimum_required(VERSION 3.25)
 
 project(
@@ -14,6 +17,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
 include(Sanitizers)
 
+# These cache options are shared by local presets and GitHub Actions.
 option(RETRACE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 set(
   RETRACE_SANITIZER
@@ -37,17 +41,22 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
 
+# Generate the development version header from the CMake project version so the
+# CLI and trace metadata use one source of truth.
 configure_file(
   cmake/version.hpp.in
   "${CMAKE_CURRENT_BINARY_DIR}/generated/retrace/version.hpp"
   @ONLY
 )
 
+# Most behavior lives in a library. The tiny executable and unit tests both link
+# this target, ensuring they exercise the same implementation.
 add_library(
   retrace_core STATIC
   src/cli/commands.cpp
   src/cli/trace_commands.cpp
   src/process/process.cpp
+  src/process/runtime_channel.cpp
   src/trace/reader.cpp
   src/trace/writer.cpp
 )
@@ -72,6 +81,8 @@ retrace_enable_sanitizers(retrace "${RETRACE_SANITIZER}")
 add_subdirectory(runtime)
 add_subdirectory(examples)
 
+# include(CTest) defines BUILD_TESTING; consumers may disable the entire test
+# graph without changing production targets.
 if(BUILD_TESTING)
   add_subdirectory(tests)
 endif()

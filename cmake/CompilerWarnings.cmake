@@ -1,3 +1,6 @@
+# Apply one reviewed warning policy to every project-owned target. Keeping this
+# in a function avoids accidentally adding flags to third-party dependencies.
+
 function(retrace_set_project_warnings target)
   if(MSVC)
     set(warnings /W4 /permissive-)
