@@ -28,16 +28,18 @@ retrace_enable_sanitizers(retrace_trace_reader_test "${RETRACE_SANITIZER}")
 
 add_test(NAME trace-reader.unit COMMAND retrace_trace_reader_test)
 
-# Target fixtures are ordinary executables, not test runners. Their absolute
-# build paths are injected into tests with generator expressions.
+# Target fixtures are ordinary uninstrumented executables, matching external
+# programs that receive RETRACE's preload. Sanitizers remain on the test runners
+# and on the dedicated test-only runtime library.
 add_executable(retrace_stream_fixture fixtures/stream_fixture.c)
 retrace_set_project_warnings(retrace_stream_fixture)
-retrace_enable_sanitizers(retrace_stream_fixture "${RETRACE_SANITIZER}")
 
 add_executable(retrace_signal_fixture fixtures/signal_fixture.c)
 retrace_set_project_warnings(retrace_signal_fixture)
-retrace_enable_sanitizers(retrace_signal_fixture "${RETRACE_SANITIZER}")
 add_dependencies(retrace_cli_test retrace_signal_fixture)
+
+add_library(retrace_preload_fixture SHARED fixtures/preload_fixture.c)
+retrace_set_project_warnings(retrace_preload_fixture)
 
 add_executable(retrace_runtime_channel_fixture fixtures/runtime_channel_fixture.c)
 target_include_directories(
@@ -46,14 +48,11 @@ target_include_directories(
 )
 target_compile_definitions(
   retrace_runtime_channel_fixture
-  PRIVATE RETRACE_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:retrace_runtime>"
+  PRIVATE
+    RETRACE_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:retrace_runtime>"
 )
 target_link_libraries(retrace_runtime_channel_fixture PRIVATE "${CMAKE_DL_LIBS}")
 retrace_set_project_warnings(retrace_runtime_channel_fixture)
-retrace_enable_sanitizers(
-  retrace_runtime_channel_fixture
-  "${RETRACE_SANITIZER}"
-)
 add_dependencies(retrace_runtime_channel_fixture retrace_runtime)
 target_compile_definitions(
   retrace_cli_test
@@ -69,24 +68,29 @@ target_include_directories(
 )
 target_compile_definitions(
   retrace_runtime_test
-  PRIVATE RETRACE_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:retrace_runtime>"
+  PRIVATE
+    RETRACE_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:${RETRACE_RUNTIME_TEST_TARGET}>"
 )
 target_link_libraries(retrace_runtime_test PRIVATE "${CMAKE_DL_LIBS}")
 retrace_set_project_warnings(retrace_runtime_test)
 retrace_enable_sanitizers(retrace_runtime_test "${RETRACE_SANITIZER}")
-add_dependencies(retrace_runtime_test retrace_runtime)
+add_dependencies(retrace_runtime_test "${RETRACE_RUNTIME_TEST_TARGET}")
 
 add_executable(retrace_process_test integration/process_test.cpp)
 target_link_libraries(retrace_process_test PRIVATE retrace::core)
 target_compile_definitions(
   retrace_process_test
   PRIVATE
+    RETRACE_PRELOAD_FIXTURE_PATH="$<TARGET_FILE:retrace_preload_fixture>"
     RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH="$<TARGET_FILE:retrace_runtime_channel_fixture>"
+    RETRACE_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:retrace_runtime>"
     RETRACE_SIGNAL_FIXTURE_PATH="$<TARGET_FILE:retrace_signal_fixture>"
     RETRACE_STREAM_FIXTURE_PATH="$<TARGET_FILE:retrace_stream_fixture>"
 )
 add_dependencies(
   retrace_process_test
+  retrace_preload_fixture
+  retrace_runtime
   retrace_runtime_channel_fixture
   retrace_signal_fixture
   retrace_stream_fixture
@@ -129,15 +133,11 @@ set_tests_properties(
   PROPERTIES PASS_REGULAR_EXPRESSION "normal example: stdout"
 )
 
-# Intentionally crashing an instrumented target adds sanitizer-runtime behavior
-# to a recorder test. Regular GCC and Clang CI still exercise the crash path.
-if(RETRACE_SANITIZER STREQUAL "none")
-  add_test(
-    NAME cli.run.example-crash
-    COMMAND
-      ${CMAKE_COMMAND}
-      -DRETRACE_EXECUTABLE=$<TARGET_FILE:retrace>
-      -DCRASH_EXAMPLE_EXECUTABLE=$<TARGET_FILE:retrace_example_crash>
-      -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_crash_example.cmake
-  )
-endif()
+add_test(
+  NAME cli.run.example-crash
+  COMMAND
+    ${CMAKE_COMMAND}
+    -DRETRACE_EXECUTABLE=$<TARGET_FILE:retrace>
+    -DCRASH_EXAMPLE_EXECUTABLE=$<TARGET_FILE:retrace_example_crash>
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/run_crash_example.cmake
+)

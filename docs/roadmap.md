@@ -86,7 +86,7 @@ Initial progress:
 - [x] Define and emit a versioned, bounded handshake frame.
 - [x] Keep absent, invalid, and closed event channels nonfatal.
 - [x] Create and validate the runtime channel in the supervisor.
-- [ ] Load the runtime into supported dynamic targets.
+- [x] Load the runtime into supported dynamic targets.
 - [ ] Interpose and record the selected libc operations.
 
 ## v0.3 — fault injection

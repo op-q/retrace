@@ -6,10 +6,14 @@ runtime messages are validated and translated before any trace frame is written.
 
 ## Current implementation boundary
 
-The first v0.2 slice builds `libretrace_runtime.so`. When the library loads, it
-looks for `RETRACE_RUNTIME_EVENT_FD`, parses that value as an inherited file
-descriptor, and sends one handshake frame. The descriptor is expected to name a
-connected Unix-domain `SOCK_SEQPACKET` socket.
+Ordinary `retrace run` commands locate `libretrace_runtime.so` beside the build
+or installed CLI and prepend its absolute path to `LD_PRELOAD`. Caller preload
+entries remain after RETRACE's entry. `--no-runtime` disables the channel and
+leaves `LD_PRELOAD` unchanged.
+
+When the library loads, it looks for `RETRACE_RUNTIME_EVENT_FD`, parses that
+value as an inherited file descriptor, and sends one handshake frame. The
+descriptor is expected to name a connected Unix-domain `SOCK_SEQPACKET` socket.
 
 If the setting is absent, empty, malformed, overflowing, names a standard
 descriptor, or refers to an unavailable peer, the runtime continues without
@@ -23,10 +27,17 @@ uses `execvpe()` with the rebuilt environment. The receiver validates each
 complete packet before translating a handshake into `runtime.handshake` trace
 evidence.
 
-No handshake is required yet because `retrace run` does not automatically load
-the runtime. A target that ignores the channel runs normally. Tests exercise the
-complete path by having a fixture load the real runtime after `exec`. Automatic
-loading, libc interposition, and operation events remain later v0.2 work.
+The runtime restores `FD_CLOEXEC` after entering the first target image. Current
+instrumentation is scoped to that image: a later `exec` inherits `LD_PRELOAD`
+but not the channel, so its constructor fails open rather than emitting a
+duplicate session handshake. Broader per-process runtime identity belongs to
+later descendant tracking.
+
+Automatic loading requires exactly one handshake. Static, setuid, and other
+loader-restricted targets may still run, but RETRACE reports instrumentation as
+unavailable after observing their result. Channel-only process-API calls keep
+the handshake optional for focused transport tests. Libc interposition and
+operation events remain later v0.2 work.
 
 ## Frame header
 
@@ -56,11 +67,11 @@ One `send()` call carries one complete frame. `SOCK_SEQPACKET` preserves frame
 boundaries, and the runtime uses `MSG_NOSIGNAL` so loss of the supervisor does
 not terminate the target. `MSG_DONTWAIT` prevents a full or misconfigured channel
 from blocking target startup. The runtime does not close the inherited
-descriptor; later operation hooks will reuse it.
+descriptor; later operation hooks will reuse it in the current target image.
 
-The environment variable is configuration metadata, not a secret. The
-supervisor removes every caller-provided value and adds exactly one descriptor
-for its target endpoint. Other RETRACE-owned descriptors remain close-on-exec.
-When the direct target exits, the supervisor drains only messages immediately
-available and closes its endpoint so an inheriting descendant cannot keep the
-run open.
+The environment variable is configuration metadata, not a secret. When runtime
+loading is enabled, the supervisor removes every caller-provided value and adds
+exactly one descriptor for its target endpoint. With `--no-runtime`, it removes
+the value without adding an endpoint. Other RETRACE-owned descriptors remain
+close-on-exec. When the direct target exits, the supervisor drains only messages
+immediately available and closes its endpoint.

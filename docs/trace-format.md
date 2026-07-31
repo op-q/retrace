@@ -137,10 +137,11 @@ successfully forwarded to the target process group. It is distinct from
 `process.signal`, which records that the direct target was ultimately terminated
 by a signal. A target may handle a forwarded signal and exit normally.
 
-`runtime.handshake` records that the supervisor received and validated one
-version-compatible handshake packet from the target's runtime channel. It proves
-that a sender reached the handshake protocol; it does not prove that later
-interposition hooks are installed or that every operation is visible.
+`runtime.handshake` records that the supervisor received and validated the one
+version-compatible packet required after automatically loading the direct
+target's runtime. It proves that the constructor reached the handshake protocol;
+it does not prove that later interposition hooks are installed or that every
+operation is visible. Runs using `--no-runtime` contain no handshake.
 
 ## Planned event extensions
 

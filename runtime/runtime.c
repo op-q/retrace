@@ -2,6 +2,7 @@
 // preserving the target's errno and avoiding allocation-heavy runtime state.
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -46,6 +47,24 @@ static int parse_event_descriptor(const char* const text) {
   return (int)value;
 }
 
+static void make_descriptor_close_on_exec(const int descriptor) {
+  // The supervisor clears this flag for the first target exec. Restoring it in
+  // the loaded image prevents an exec'd descendant from emitting a second
+  // session handshake through an inherited channel.
+  int flags = -1;
+  do {
+    flags = fcntl(descriptor, F_GETFD);
+  } while (flags < 0 && errno == EINTR);
+  if (flags < 0) {
+    return;
+  }
+
+  int result = -1;
+  do {
+    result = fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC);
+  } while (result < 0 && errno == EINTR);
+}
+
 static void emit_handshake(void) {
   // The runtime is a guest inside another process: instrumentation failure must
   // not block startup, raise SIGPIPE, or alter the caller-visible errno value.
@@ -53,6 +72,8 @@ static void emit_handshake(void) {
   const int descriptor = parse_event_descriptor(getenv(RETRACE_RUNTIME_EVENT_FD_ENV));
 
   if (descriptor >= 0) {
+    make_descriptor_close_on_exec(descriptor);
+
     unsigned char frame[RETRACE_RUNTIME_FRAME_HEADER_SIZE] = {0U};
     frame[RETRACE_RUNTIME_FRAME_MAGIC_OFFSET + 0U] = RETRACE_RUNTIME_PROTOCOL_MAGIC_0;
     frame[RETRACE_RUNTIME_FRAME_MAGIC_OFFSET + 1U] = RETRACE_RUNTIME_PROTOCOL_MAGIC_1;

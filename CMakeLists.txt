@@ -17,6 +17,15 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
 include(Sanitizers)
 
+# The installed CLI finds the runtime relative to its own executable, preserving
+# relocatability while still supporting GNUInstallDirs layouts such as lib64.
+file(
+  RELATIVE_PATH
+  RETRACE_INSTALL_LIBDIR_FROM_BINDIR
+  "${CMAKE_INSTALL_FULL_BINDIR}"
+  "${CMAKE_INSTALL_FULL_LIBDIR}"
+)
+
 # These cache options are shared by local presets and GitHub Actions.
 option(RETRACE_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 set(
@@ -79,6 +88,19 @@ retrace_set_project_warnings(retrace)
 retrace_enable_sanitizers(retrace "${RETRACE_SANITIZER}")
 
 add_subdirectory(runtime)
+
+# Build-tree binaries use the exact generated-library path. Installed binaries
+# use the configured relative libdir so they never fall back to a private build
+# artifact that merely happens to remain on the developer's machine.
+target_compile_definitions(
+  retrace_core
+  PRIVATE
+    RETRACE_BUILD_EXECUTABLE_DIRECTORY="${CMAKE_RUNTIME_OUTPUT_DIRECTORY}"
+    RETRACE_BUILD_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:retrace_runtime>"
+    RETRACE_INSTALL_LIBDIR_FROM_BINDIR="${RETRACE_INSTALL_LIBDIR_FROM_BINDIR}"
+)
+add_dependencies(retrace_core retrace_runtime)
+
 add_subdirectory(examples)
 
 # include(CTest) defines BUILD_TESTING; consumers may disable the entire test

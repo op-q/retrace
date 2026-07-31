@@ -3,6 +3,7 @@
 
 #include <sys/utsname.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <filesystem>
@@ -11,12 +12,25 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <utility>
 
 #include "retrace/cli.hpp"
 #include "retrace/process.hpp"
 #include "retrace/trace.hpp"
 #include "retrace/version.hpp"
 #include "trace_commands.hpp"
+
+#ifndef RETRACE_BUILD_EXECUTABLE_DIRECTORY
+#error "RETRACE_BUILD_EXECUTABLE_DIRECTORY must name the build binary directory"
+#endif
+
+#ifndef RETRACE_BUILD_RUNTIME_LIBRARY_PATH
+#error "RETRACE_BUILD_RUNTIME_LIBRARY_PATH must name the build runtime library"
+#endif
+
+#ifndef RETRACE_INSTALL_LIBDIR_FROM_BINDIR
+#error "RETRACE_INSTALL_LIBDIR_FROM_BINDIR must locate the installed library directory"
+#endif
 
 namespace retrace::cli {
 namespace {
@@ -32,15 +46,18 @@ Commands:
 )";
 
 constexpr std::string_view run_usage =
-    "usage: retrace run [--output TRACE] [--working-directory PATH] -- "
+    "usage: retrace run [--output TRACE] [--working-directory PATH] "
+    "[--no-runtime] -- "
     "COMMAND [ARGS...]\n";
 
 constexpr std::string_view run_help_text = R"(Usage:
-  retrace run [--output TRACE] [--working-directory PATH] -- COMMAND [ARGS...]
+  retrace run [--output TRACE] [--working-directory PATH] [--no-runtime] --
+    COMMAND [ARGS...]
 
 Options:
   --output TRACE             Record the run without overwriting TRACE
   --working-directory PATH   Run the target from an existing directory
+  --no-runtime               Do not load the RETRACE runtime
 
 Signals:
   SIGINT and SIGTERM received by RETRACE are forwarded to the target group.
@@ -121,14 +138,23 @@ struct RunArguments {
   std::optional<std::string_view> output_path;
   std::optional<std::string_view> working_directory;
   std::span<const std::string_view> target;
+  bool no_runtime = false;
 };
 
 [[nodiscard]] bool parse_run_arguments(
     const std::span<const std::string_view> arguments, RunArguments& result) {
   // Parsing stays dependency-free while the option surface is small. Each
-  // accepted option consumes exactly one following value.
+  // path option consumes one following value; flags advance independently.
   std::size_t index = 1U;
   while (index < arguments.size() && arguments[index] != "--") {
+    if (arguments[index] == "--no-runtime") {
+      if (result.no_runtime) {
+        return false;
+      }
+      result.no_runtime = true;
+      ++index;
+      continue;
+    }
     if (index + 1U >= arguments.size()) {
       return false;
     }
@@ -148,6 +174,50 @@ struct RunArguments {
   }
   result.target = arguments.subspan(index + 1U);
   return true;
+}
+
+[[nodiscard]] std::error_code locate_runtime_library(std::filesystem::path& result) {
+  // Build binaries use the exact target path produced by CMake. Installed
+  // binaries derive the configured libdir from /proc/self/exe, so a stale local
+  // build cannot accidentally become an installed command's preload source.
+  std::error_code executable_error;
+  const auto executable =
+      std::filesystem::canonical("/proc/self/exe", executable_error);
+  if (executable_error) {
+    return executable_error;
+  }
+
+  std::error_code build_directory_error;
+  const auto build_directory = std::filesystem::canonical(
+      std::filesystem::path{RETRACE_BUILD_EXECUTABLE_DIRECTORY}, build_directory_error);
+
+  const std::filesystem::path build_runtime{RETRACE_BUILD_RUNTIME_LIBRARY_PATH};
+  const auto candidate =
+      !build_directory_error && executable.parent_path() == build_directory
+          ? build_runtime
+          : executable.parent_path() /
+                std::filesystem::path{RETRACE_INSTALL_LIBDIR_FROM_BINDIR} /
+                build_runtime.filename();
+
+  std::error_code runtime_error;
+  auto runtime = std::filesystem::canonical(candidate, runtime_error);
+  if (runtime_error) {
+    return runtime_error;
+  }
+  if (!std::filesystem::is_regular_file(runtime, runtime_error)) {
+    return runtime_error ? runtime_error
+                         : std::make_error_code(std::errc::no_such_file_or_directory);
+  }
+  const auto& bytes = runtime.native();
+  if (bytes.empty() || std::any_of(bytes.begin(), bytes.end(), [](const char byte) {
+        return byte == ':' || byte == ' ' || byte == '\t' || byte == '\n' ||
+               byte == '\r' || byte == '\f' || byte == '\v';
+      })) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+
+  result = std::move(runtime);
+  return {};
 }
 
 [[nodiscard]] trace::CreationResult create_trace_writer(
@@ -213,6 +283,16 @@ struct RunArguments {
     return static_cast<int>(ExitCode::internal_error);
   }
 
+  std::filesystem::path runtime_library;
+  if (!run_arguments.no_runtime) {
+    if (const auto runtime_error = locate_runtime_library(runtime_library)) {
+      error << "error: RETRACE runtime library could not be selected\n"
+            << "cause: " << runtime_error.message() << '\n'
+            << "target was not started\n";
+      return static_cast<int>(ExitCode::internal_error);
+    }
+  }
+
   trace::Writer trace_writer;
   if (run_arguments.output_path) {
     const auto creation =
@@ -231,6 +311,7 @@ struct RunArguments {
 
   std::error_code trace_error;
   const auto& working_directory_bytes = working_directory.native();
+  const auto& runtime_library_bytes = runtime_library.native();
   const auto result = process::execute(
       run_arguments.target,
       [&output, &error, &trace_writer,
@@ -246,7 +327,9 @@ struct RunArguments {
             event.type == process::ProcessEventType::standard_output ? output : error;
         return forward_output(destination, event.bytes);
       },
-      {.working_directory = working_directory_bytes});
+      {.working_directory = working_directory_bytes,
+       .runtime_library = runtime_library_bytes,
+       .runtime_channel_enabled = !run_arguments.no_runtime});
 
   if (trace_writer.is_open()) {
     const auto finish_error = trace_writer.finish();
@@ -272,6 +355,18 @@ struct RunArguments {
       error << "error: target could not be started\n"
             << "cause: " << result.error.message() << '\n';
       return static_cast<int>(ExitCode::target_launch_error);
+    case process::ProcessState::runtime_unavailable:
+      error << "error: RETRACE runtime could not instrument the target\n"
+            << "cause: the required runtime handshake was not received\n";
+      if (result.signal_number > 0) {
+        error << "target result: signal(" << result.signal_number << ")\n";
+      } else {
+        error << "target result: exit(" << result.exit_code << ")\n";
+      }
+      if (run_arguments.output_path) {
+        error << "note: the trace contains lifecycle data but no runtime handshake\n";
+      }
+      return static_cast<int>(ExitCode::internal_error);
     case process::ProcessState::supervisor_failed:
       error << "error: RETRACE could not supervise the target\n"
             << "cause: " << result.error.message() << '\n';

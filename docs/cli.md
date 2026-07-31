@@ -1,14 +1,16 @@
 # Command-line interface
 
-`version`, help, `run -- COMMAND [ARGS...]`, selected working directories,
-explicit trace creation, signal forwarding, inspection, and structural
-validation are implemented. Export, scenarios, filters, and the remaining run
-options are planned. Examples are labeled where they describe future behavior.
+`version`, help, `run -- COMMAND [ARGS...]`, automatic runtime loading,
+`--no-runtime`, selected working directories, explicit trace creation, signal
+forwarding, inspection, and structural validation are implemented. Export,
+scenarios, filters, and the remaining run options are planned. Examples are
+labeled where they describe future behavior.
 
 ## Commands
 
 ```text
-retrace run [--output TRACE] [--working-directory PATH] -- COMMAND [ARGS...]
+retrace run [--output TRACE] [--working-directory PATH] [--no-runtime] --
+  COMMAND [ARGS...]
 retrace inspect TRACE
 retrace validate TRACE
 retrace version
@@ -21,7 +23,8 @@ Planned commands include `export` and `scenario`.
 ## Run a target
 
 ```bash
-retrace run [--output TRACE] [--working-directory PATH] -- COMMAND [ARGS...]
+retrace run [--output TRACE] [--working-directory PATH] [--no-runtime] -- \
+  COMMAND [ARGS...]
 ```
 
 Everything after `--` belongs to the target. RETRACE currently launches the
@@ -47,12 +50,18 @@ means that the close-on-exec launch-status pipe reached EOF without reporting an
 that the child reached target program entry because an unusual pre-`execvpe()`
 termination can also close the pipe.
 
-Each run also creates a nonblocking Unix-domain runtime channel and replaces any
-caller-provided `RETRACE_RUNTIME_EVENT_FD` value with its intended inherited
-endpoint. Targets may ignore it. If a target independently loads
-`libretrace_runtime.so`, a valid handshake is recorded as `runtime.handshake`.
-The CLI does not yet add `LD_PRELOAD` or otherwise load the library
-automatically.
+Unless `--no-runtime` is present, each run locates its build-tree or installed
+`libretrace_runtime.so`, creates a nonblocking Unix-domain runtime channel, and
+prepends the library's absolute path to `LD_PRELOAD` while preserving caller
+preloads. Every caller-provided `RETRACE_RUNTIME_EVENT_FD` is replaced with the
+intended inherited endpoint. A valid constructor handshake is required and
+recorded as `runtime.handshake`.
+
+If the dynamic loader ignores the preload—for example for a static or setuid
+target—RETRACE still observes and records the direct target's result, then
+returns internal-failure code `1` with an explicit unavailable-runtime
+diagnostic. `--no-runtime` avoids the preload requirement, removes the owned
+channel from the target environment, and returns the ordinary target result.
 
 Trace creation never overwrites an existing path, does not follow a final
 symlink, uses user-only permissions, and occurs before the target starts. Parent
@@ -78,7 +87,6 @@ Planned options include:
 --seed NUMBER
 --capture-stdout
 --capture-stderr
---no-runtime
 --environment KEY=VALUE
 --inherit-environment KEY
 --verbose

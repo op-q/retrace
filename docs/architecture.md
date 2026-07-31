@@ -8,9 +8,10 @@ metadata and observed lifecycle and stream events to a versioned trace. Each
 target leads a process group; RETRACE synchronously receives `SIGINT` and
 `SIGTERM`, forwards them to that group, and records successful forwarding. It can
 also validate a trace's v1.0 structure and render its complete events as a
-terminal timeline. Every run creates and validates a runtime event channel, but
-RETRACE does not yet load the runtime automatically or interpose libc
-operations. Trace export and fault injection are not yet implemented.
+terminal timeline. Ordinary runs automatically preload the C runtime into
+supported dynamic targets, require its validated handshake, and allow an
+explicit `--no-runtime` opt-out. Libc-operation interposition, trace export, and
+fault injection are not yet implemented.
 
 The target architecture will supervise the command, record selected runtime
 events, and write them to a trace. Later it will reproduce explicitly configured
@@ -36,10 +37,12 @@ Trace file
 ### CLI
 
 The current CLI parses `help`, `version`, `run`, `inspect`, and `validate`,
-including an explicit `run --output TRACE` recording path. It validates command
-arguments and returns documented exit codes. Scenario loading, export, filters,
-and further output selection will be added with their corresponding features.
-The public interface should remain stable even while internals evolve.
+including an explicit `run --output TRACE` recording path and `run
+--no-runtime`. It locates the build-tree or installed sibling runtime before
+starting the target, validates command arguments, and returns documented exit
+codes. Scenario loading, export, filters, and further output selection will be
+added with their corresponding features. The public interface should remain
+stable even while internals evolve.
 
 ### Supervisor
 
@@ -63,13 +66,13 @@ RETRACE still waits for and reports only the direct target.
 The current launch sequence is:
 
 1. Parse the command and validate the selected working directory.
-2. Create the trace, stdout/stderr pipes, launch-status pipe, runtime channel,
-   and signal source.
+2. Locate the runtime unless disabled, then create the trace, stdout/stderr
+   pipes, launch-status pipe, runtime channel, and signal source.
 3. Call `fork()`.
 4. In the child, create the target process group, restore the inherited signal
    mask, change directory, redirect descriptors, make the target runtime
    endpoint inheritable, and call `execvpe()` with an explicitly rebuilt
-   environment.
+   environment that prepends RETRACE to any caller `LD_PRELOAD` entries.
 5. In the parent, close unused pipe ends, record `process.start`, poll streams
    with the runtime and signal sources, validate any handshake, forward signals
    with `kill(-pgid, signal)`, and check completion with `waitpid()`.
@@ -83,17 +86,23 @@ tracking remain later work. Linux subreaper behavior may be evaluated later.
 ### Injected runtime
 
 The current v0.2 slices build a deliberately small C shared library and a
-supervisor-owned Unix-domain sequenced-packet channel. The target environment
-replaces any caller-provided `RETRACE_RUNTIME_EVENT_FD` value with the intended
-inherited endpoint. If a target independently loads the runtime, its constructor
-emits a versioned handshake; the supervisor validates the complete packet and
-records `runtime.handshake`. Missing, malformed, or closed channels remain
-nonfatal inside the runtime. A malformed packet is a supervisor protocol error,
-but RETRACE still reaps the direct target and can retain observed lifecycle
-evidence. Automatic library loading is not implemented yet.
+supervisor-owned Unix-domain sequenced-packet channel. Unless `--no-runtime` is
+used, the CLI locates its build-tree or installed runtime and prepends its
+absolute path to `LD_PRELOAD` while preserving caller entries. The target
+environment replaces any caller-provided `RETRACE_RUNTIME_EVENT_FD` value with
+the intended inherited endpoint. The runtime constructor emits a versioned
+handshake, restores close-on-exec on the channel for later target execs, and
+preserves `errno`; the supervisor validates the packet and records
+`runtime.handshake`.
 
-The completed runtime will be loaded into dynamically linked targets through
-`LD_PRELOAD`. It will:
+Missing, malformed, or closed channels remain nonfatal inside the runtime. A
+malformed packet is a supervisor protocol error, but RETRACE still reaps the
+direct target and can retain observed lifecycle evidence. When automatic loading
+was requested, an absent handshake is reported as unavailable instrumentation
+after the direct target's result is observed. `--no-runtime` removes the owned
+channel and does not alter `LD_PRELOAD`.
+
+The runtime will next:
 
 - interpose selected libc calls;
 - resolve the real symbol with `dlsym(RTLD_NEXT, ...)`;

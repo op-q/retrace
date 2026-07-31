@@ -37,23 +37,53 @@ namespace {
   return {error_number, std::generic_category()};
 }
 
+[[nodiscard]] bool is_preload_separator(const char byte) {
+  return byte == ':' || byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r' ||
+         byte == '\f' || byte == '\v';
+}
+
 void build_target_environment(const int runtime_descriptor,
+                              const std::string_view runtime_library,
                               std::vector<std::string>& owned_environment,
                               std::vector<char*>& environment_pointers) {
   // Build all strings before the char* array so vector growth cannot invalidate
-  // pointers. Every caller-provided channel value is removed, then one trusted
-  // descriptor entry is appended.
+  // pointers. RETRACE replaces its channel value and, when injecting, prepends
+  // its library while retaining every caller-provided preload token.
   const std::string runtime_prefix = std::string{RETRACE_RUNTIME_EVENT_FD_ENV} + '=';
+  constexpr std::string_view preload_prefix = "LD_PRELOAD=";
+  std::string inherited_preloads;
 
   if (environ != nullptr) {
     for (auto cursor = environ; *cursor != nullptr; ++cursor) {
       const std::string_view entry{*cursor};
-      if (!entry.starts_with(runtime_prefix)) {
-        owned_environment.emplace_back(entry);
+      if (entry.starts_with(runtime_prefix)) {
+        continue;
       }
+      if (!runtime_library.empty() && entry.starts_with(preload_prefix)) {
+        const auto value = entry.substr(preload_prefix.size());
+        if (!value.empty()) {
+          if (!inherited_preloads.empty()) {
+            inherited_preloads.push_back(':');
+          }
+          inherited_preloads.append(value);
+        }
+        continue;
+      }
+      owned_environment.emplace_back(entry);
     }
   }
-  owned_environment.push_back(runtime_prefix + std::to_string(runtime_descriptor));
+  if (runtime_descriptor >= 0) {
+    owned_environment.push_back(runtime_prefix + std::to_string(runtime_descriptor));
+  }
+  if (!runtime_library.empty()) {
+    std::string preload{preload_prefix};
+    preload.append(runtime_library);
+    if (!inherited_preloads.empty()) {
+      preload.push_back(':');
+      preload.append(inherited_preloads);
+    }
+    owned_environment.push_back(std::move(preload));
+  }
 
   environment_pointers.reserve(owned_environment.size() + 1U);
   for (auto& entry : owned_environment) {
@@ -210,6 +240,7 @@ struct CaptureResult {
   std::error_code runtime_error;
   std::error_code signal_error;
   std::error_code wait_error;
+  bool runtime_handshake_received = false;
 };
 
 // A handler failure stops future callback delivery but never abandons the
@@ -350,7 +381,6 @@ struct ChildPollResult {
   CaptureResult result;
   std::size_t first_stream = 0U;
   bool child_reaped = false;
-  bool runtime_handshake_received = false;
 
   while (!child_reaped) {
     if (const auto error = forward_pending_signals(signal_descriptor, events, child)) {
@@ -407,8 +437,8 @@ struct ChildPollResult {
         result.runtime_error = std::make_error_code(std::errc::bad_file_descriptor);
         runtime_channel.close_supervisor_end();
       } else if ((runtime_events & (POLLIN | POLLHUP)) != 0) {
-        if (const auto error = receive_runtime_messages(runtime_channel, events,
-                                                        runtime_handshake_received)) {
+        if (const auto error = receive_runtime_messages(
+                runtime_channel, events, result.runtime_handshake_received)) {
           result.runtime_error = error;
           runtime_channel.close_supervisor_end();
         }
@@ -526,8 +556,8 @@ struct ChildPollResult {
     }
 
     if (runtime_channel.supervisor_descriptor() >= 0) {
-      if (const auto error = receive_runtime_messages(runtime_channel, events,
-                                                      runtime_handshake_received)) {
+      if (const auto error = receive_runtime_messages(
+              runtime_channel, events, result.runtime_handshake_received)) {
         result.runtime_error = error;
       }
       runtime_channel.close_supervisor_end();
@@ -557,7 +587,13 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
                   [](const auto argument) {
                     return argument.find('\0') != std::string_view::npos;
                   }) ||
-      options.working_directory.find('\0') != std::string_view::npos) {
+      options.working_directory.find('\0') != std::string_view::npos ||
+      options.runtime_library.find('\0') != std::string_view::npos ||
+      (!options.runtime_library.empty() &&
+       (options.runtime_library.front() != '/' ||
+        std::any_of(options.runtime_library.begin(), options.runtime_library.end(),
+                    is_preload_separator))) ||
+      (!options.runtime_channel_enabled && !options.runtime_library.empty())) {
     return {.state = ProcessState::supervisor_failed,
             .error = std::make_error_code(std::errc::invalid_argument)};
   }
@@ -590,14 +626,16 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     return {.state = ProcessState::supervisor_failed, .error = error};
   }
   RuntimeChannel runtime_channel;
-  if (const auto error = RuntimeChannel::create(runtime_channel)) {
-    return {.state = ProcessState::supervisor_failed, .error = error};
+  if (options.runtime_channel_enabled) {
+    if (const auto error = RuntimeChannel::create(runtime_channel)) {
+      return {.state = ProcessState::supervisor_failed, .error = error};
+    }
   }
 
   std::vector<std::string> owned_environment;
   std::vector<char*> environment_pointers;
-  build_target_environment(runtime_channel.target_descriptor(), owned_environment,
-                           environment_pointers);
+  build_target_environment(runtime_channel.target_descriptor(), options.runtime_library,
+                           owned_environment, environment_pointers);
 
   ForwardedSignals forwarded_signals;
   if (const auto error = forwarded_signals.start()) {
@@ -644,10 +682,12 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
 
     standard_output.close_write_end();
     standard_error.close_write_end();
-    if (const int error = runtime_channel.make_target_descriptor_inheritable();
-        error != 0) {
-      send_launch_error(launch_errors.write_descriptor(), error);
-      ::_exit(127);
+    if (runtime_channel.target_descriptor() >= 0) {
+      if (const int error = runtime_channel.make_target_descriptor_inheritable();
+          error != 0) {
+        send_launch_error(launch_errors.write_descriptor(), error);
+        ::_exit(127);
+      }
     }
     ::execvpe(argument_pointers.front(), argument_pointers.data(),
               environment_pointers.data());
@@ -741,6 +781,12 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
               .process_id = static_cast<int>(child),
               .error = events.error()};
     }
+    if (!options.runtime_library.empty() && !capture.runtime_handshake_received) {
+      return {.state = ProcessState::runtime_unavailable,
+              .exit_code = exit_code,
+              .process_id = static_cast<int>(child),
+              .error = std::make_error_code(std::errc::not_supported)};
+    }
     return {.state = ProcessState::exited,
             .exit_code = exit_code,
             .process_id = static_cast<int>(child),
@@ -758,6 +804,12 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
       return {.state = ProcessState::supervisor_failed,
               .process_id = static_cast<int>(child),
               .error = events.error()};
+    }
+    if (!options.runtime_library.empty() && !capture.runtime_handshake_received) {
+      return {.state = ProcessState::runtime_unavailable,
+              .signal_number = signal_number,
+              .process_id = static_cast<int>(child),
+              .error = std::make_error_code(std::errc::not_supported)};
     }
     return {.state = ProcessState::signaled,
             .signal_number = signal_number,

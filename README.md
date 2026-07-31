@@ -27,15 +27,17 @@ RETRACE is pre-alpha but has a working process-recording and inspection slice:
   unknown event types;
 - `retrace validate TRACE` checks the v1.0 structure without loading the whole
   event stream into memory; and
-- each run creates a bounded Unix-domain runtime channel, replaces any
-  caller-provided channel descriptor, and records a validated
-  `runtime.handshake` when a target independently loads the runtime; and
+- each ordinary run locates and loads `libretrace_runtime.so` with `LD_PRELOAD`,
+  preserves caller preload entries, validates its bounded Unix-domain channel,
+  and records `runtime.handshake`; `--no-runtime` disables this path; and
 - dependency-free tests exercise the CLI, process and trace layers, plus C
   stream and runtime fixtures.
 
-Automatic runtime loading, libc-operation instrumentation, time limits, trace
-export, and fault injection are not implemented yet. A successful validation
-means that the bytes are structurally valid v1.0; because v1.0 has no footer or
+Libc-operation instrumentation, time limits, trace export, and fault injection
+are not implemented yet. Static, setuid, or otherwise loader-restricted targets
+cannot be instrumented; RETRACE reports a missing required handshake after
+preserving their observed lifecycle evidence. A successful validation means
+that the bytes are structurally valid v1.0; because v1.0 has no footer or
 checksum, it does not prove that a run was finalized or that its contents are
 authentic.
 
@@ -50,6 +52,7 @@ The current runner can execute a target:
 ./build/dev/bin/retrace run -- python3 -c 'print("hello from Python")'
 ./build/dev/bin/retrace run --output /tmp/example.rtc -- /bin/echo recorded
 ./build/dev/bin/retrace run --working-directory /tmp -- /bin/pwd
+./build/dev/bin/retrace run --no-runtime -- /bin/echo recorder-only
 ```
 
 Recorded traces can be inspected or structurally validated:
@@ -61,11 +64,11 @@ Recorded traces can be inspected or structurally validated:
 
 The v0.1 process-recorder slice is implemented. The v0.2 work now includes a
 standalone C17 library, versioned handshake, and a supervisor-owned channel that
-validates and records the handshake. `retrace run` does not yet load the runtime
-into targets automatically.
+automatically loads the runtime into supported dynamic targets, validates the
+handshake, and records it. Operation interposition remains the next v0.2 slice.
 
-Later releases will add a small C runtime loaded with `LD_PRELOAD` so selected
-libc operations can be observed and controlled:
+Later v0.2 work will use the loaded runtime to observe selected libc operations;
+v0.3 will control them with bounded fault rules:
 
 ```bash
 # Planned for v0.3; not implemented yet.

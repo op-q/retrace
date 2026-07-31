@@ -6,6 +6,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -86,6 +87,10 @@ static void test_handshake_frame(void) {
     if (set_descriptor_environment(channel[1]) < 0 || load_runtime() < 0) {
       _exit(EXIT_FAILURE);
     }
+    const int descriptor_flags = fcntl(channel[1], F_GETFD);
+    if (descriptor_flags < 0 || (descriptor_flags & FD_CLOEXEC) == 0) {
+      _exit(EXIT_FAILURE);
+    }
     close(channel[1]);
     _exit(EXIT_SUCCESS);
   }
@@ -122,7 +127,8 @@ static void test_handshake_frame(void) {
                load_u32_le(&frame[RETRACE_RUNTIME_FRAME_PAYLOAD_SIZE_OFFSET]) == 0U,
            "the handshake has the expected type, flags, and empty payload");
   }
-  expect(wait_for_success(child), "the handshaking target continues normally");
+  expect(wait_for_success(child),
+         "the handshaking target continues and secures the inherited descriptor");
 }
 
 static void run_unavailable_channel_case(const char* const value,

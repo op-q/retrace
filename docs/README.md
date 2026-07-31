@@ -11,7 +11,7 @@ Read these in order when learning the project:
 1. [Product goals and scope](product.md) — the problem, intended users, goals,
    and explicit non-goals.
 2. [Architecture](architecture.md) — the implemented component boundaries and
-   the planned C runtime.
+   injected C runtime.
 3. [CLI](cli.md) — current commands, exit behavior, and clearly labeled planned
    options.
 4. [Recorder examples](examples.md) — small normal and intentional-crash target

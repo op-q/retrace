@@ -13,10 +13,12 @@ namespace retrace::process {
 
 enum class ProcessState : std::uint8_t {
   // `exited` and `signaled` describe the target. The failure states distinguish
-  // target launch errors from failures inside RETRACE's supervisor.
+  // target launch errors, unavailable requested instrumentation, and failures
+  // inside RETRACE's supervisor.
   exited,
   signaled,
   launch_failed,
+  runtime_unavailable,
   supervisor_failed,
 };
 
@@ -59,7 +61,18 @@ struct ProcessResult {
 struct ExecuteOptions {
   // Empty means inherit the caller's working directory. The byte view must not
   // contain NUL because chdir(2) consumes a NUL-terminated path.
-  std::string_view working_directory;
+  // Explicit aggregate defaults prevent GCC's missing-field warning when a
+  // caller designates only one later option.
+  std::string_view working_directory{};  // NOLINT(readability-redundant-member-init)
+
+  // A non-empty absolute path is prepended to LD_PRELOAD and makes one validated
+  // runtime handshake mandatory. Loader token separators are rejected because
+  // LD_PRELOAD has no escaping for paths containing them.
+  std::string_view runtime_library{};  // NOLINT(readability-redundant-member-init)
+
+  // Channel-only mode is the default for API compatibility and focused runtime
+  // tests. Setting this false also requires an empty runtime_library.
+  bool runtime_channel_enabled = true;
 };
 
 // An empty list or an argument containing an embedded NUL is rejected before

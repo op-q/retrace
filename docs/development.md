@@ -71,12 +71,19 @@ trace-format exit codes. Process tests also verify that a descendant retaining
 inherited stream descriptors cannot hold the direct target's capture open,
 selected working directories are preserved, both forwarded signals reach the
 target group, and the caller's original signal mask is restored. CTest also runs
-the normal and intentional-crash examples through the CLI in unsanitized builds;
-sanitizer builds omit the deliberate crash while retaining signal integration
-coverage. Runtime-channel integration tests load the real C library after
-`exec`, require exactly one handshake, confirm a target may ignore the channel,
-and reject malformed magic, versions, flags, types, sizes, short packets,
-oversized packets, and duplicate handshakes while still observing target exit.
+the ordinary uninstrumented normal and intentional-crash targets through the
+CLI while sanitizer builds instrument the supervisor and test runners.
+Runtime-channel integration tests cover automatic `LD_PRELOAD`,
+caller-preload preservation, the `--no-runtime` channel boundary, explicit
+missing-handshake classification, and manual channel-only loading. They also
+reject malformed magic, versions, flags, types, sizes, short packets, oversized
+packets, and duplicate handshakes while still observing target exit.
+
+The production preload is deliberately uninstrumented even in sanitizer builds
+so it remains loadable by ordinary external targets. Those builds produce a
+second test-only runtime shared library; the sanitized C runtime test loads that
+copy inside a sanitizer-enabled fixture. This retains runtime sanitizer coverage
+without imposing sanitizer loader-order requirements on recorded programs.
 
 As features land, unit tests will cover duration, signal, and rule parsing; path
 matching; encoding and decoding; format bounds; rendering; and corrupt payloads.
