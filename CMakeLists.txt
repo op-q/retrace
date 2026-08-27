@@ -13,6 +13,10 @@ project(
 include(CTest)
 include(GNUInstallDirs)
 
+# The injected runtime installs a pthread_atfork(3) handler so a target that
+# forks without exec stops reporting another process's operations.
+find_package(Threads REQUIRED)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
 include(Sanitizers)

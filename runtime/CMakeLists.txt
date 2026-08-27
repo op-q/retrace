@@ -9,6 +9,9 @@ function(retrace_configure_runtime target)
     PRIVATE "${PROJECT_SOURCE_DIR}/include"
   )
   target_compile_features("${target}" PRIVATE c_std_17)
+  # dlsym(3) resolves each interposed symbol's real implementation, and
+  # pthread_atfork(3) disables reporting in a forked child.
+  target_link_libraries("${target}" PRIVATE "${CMAKE_DL_LIBS}" Threads::Threads)
   set_target_properties(
     "${target}"
     PROPERTIES

@@ -311,13 +311,39 @@ struct MonitoredStream {
   ProcessEventType event_type = ProcessEventType::standard_output;
 };
 
+// Runtime-channel state that must persist across drains. Sequence accounting
+// tolerates reordering: each target thread takes a sequence number before its
+// own send(2), so two threads can deliver 6 before 5 without either being lost.
+// Comparing the highest number seen against the number actually received
+// therefore measures loss correctly, while a running "expected next" counter
+// would misreport ordinary concurrency as dropped events.
+struct RuntimeReceiveState {
+  bool handshake_received = false;
+  bool any_operation_seen = false;
+  std::uint64_t highest_sequence = 0U;
+  std::uint64_t received_operations = 0U;
+  RuntimeOperation operation;
+
+  [[nodiscard]] std::uint64_t dropped_operations() const noexcept {
+    if (!any_operation_seen) {
+      return 0U;
+    }
+    // The target supplies these numbers and may repeat them, which would make
+    // more packets arrive than the highest sequence accounts for. Reporting an
+    // underflowed count as an enormous loss would be worse than reporting none,
+    // so the subtraction is guarded.
+    const std::uint64_t expected = highest_sequence + 1U;
+    return expected > received_operations ? expected - received_operations : 0U;
+  }
+};
+
 struct CaptureResult {
   int wait_status = 0;
   std::error_code output_error;
   std::error_code runtime_error;
   std::error_code signal_error;
   std::error_code wait_error;
-  bool runtime_handshake_received = false;
+  RuntimeReceiveState runtime;
 };
 
 // A handler failure stops future callback delivery but never abandons the
@@ -343,6 +369,26 @@ class EventDispatcher final {
     }
   }
 
+  // Operations are delivered by borrowed pointer because the supervisor reuses
+  // one instance for every packet it decodes.
+  void send_operation(const RuntimeOperation& operation) {
+    if (!handler_ || error_) {
+      return;
+    }
+
+    try {
+      error_ = handler_({.type = ProcessEventType::runtime_operation,
+                         .process_id = process_id_,
+                         .value = 0,
+                         .bytes = {},
+                         .operation = &operation});
+    } catch (const std::system_error& error) {
+      error_ = error.code();
+    } catch (...) {
+      error_ = std::make_error_code(std::errc::io_error);
+    }
+  }
+
   [[nodiscard]] const std::error_code& error() const noexcept { return error_; }
 
  private:
@@ -353,18 +399,32 @@ class EventDispatcher final {
 
 [[nodiscard]] std::error_code receive_runtime_messages(RuntimeChannel& runtime_channel,
                                                        EventDispatcher& events,
-                                                       bool& handshake_received) {
+                                                       RuntimeReceiveState& state) {
   // Drain only what is immediately queued. A second handshake is invalid in the
   // current session-level protocol and closes the instrumentation channel.
   while (runtime_channel.supervisor_descriptor() >= 0) {
-    const auto received = runtime_channel.receive();
+    const auto received = runtime_channel.receive(state.operation);
     switch (received.status) {
       case RuntimeReceiveStatus::handshake:
-        if (handshake_received) {
+        if (state.handshake_received) {
           return std::make_error_code(std::errc::protocol_error);
         }
-        handshake_received = true;
+        state.handshake_received = true;
         events.send(ProcessEventType::runtime_handshake);
+        break;
+      case RuntimeReceiveStatus::operation:
+        // An operation before the handshake would mean the runtime reported
+        // work it never announced itself for, so the channel is not trusted.
+        if (!state.handshake_received) {
+          return std::make_error_code(std::errc::protocol_error);
+        }
+        state.received_operations += 1U;
+        if (!state.any_operation_seen ||
+            state.operation.sequence > state.highest_sequence) {
+          state.highest_sequence = state.operation.sequence;
+        }
+        state.any_operation_seen = true;
+        events.send_operation(state.operation);
         break;
       case RuntimeReceiveStatus::would_block:
         return {};
@@ -524,8 +584,8 @@ struct ChildPollResult {
         result.runtime_error = std::make_error_code(std::errc::bad_file_descriptor);
         runtime_channel.close_supervisor_end();
       } else if ((runtime_events & (POLLIN | POLLHUP)) != 0) {
-        if (const auto error = receive_runtime_messages(
-                runtime_channel, events, result.runtime_handshake_received)) {
+        if (const auto error =
+                receive_runtime_messages(runtime_channel, events, result.runtime)) {
           result.runtime_error = error;
           runtime_channel.close_supervisor_end();
         }
@@ -643,8 +703,8 @@ struct ChildPollResult {
     }
 
     if (runtime_channel.supervisor_descriptor() >= 0) {
-      if (const auto error = receive_runtime_messages(
-              runtime_channel, events, result.runtime_handshake_received)) {
+      if (const auto error =
+              receive_runtime_messages(runtime_channel, events, result.runtime)) {
         result.runtime_error = error;
       }
       runtime_channel.close_supervisor_end();
@@ -891,7 +951,7 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
               .process_id = static_cast<int>(child),
               .error = events.error()};
     }
-    if (!options.runtime_library.empty() && !capture.runtime_handshake_received) {
+    if (!options.runtime_library.empty() && !capture.runtime.handshake_received) {
       return {.state = ProcessState::runtime_unavailable,
               .exit_code = exit_code,
               .process_id = static_cast<int>(child),
@@ -900,6 +960,7 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     return {.state = ProcessState::exited,
             .exit_code = exit_code,
             .process_id = static_cast<int>(child),
+            .dropped_runtime_operations = capture.runtime.dropped_operations(),
             .error = {}};
   }
   if (WIFSIGNALED(capture.wait_status)) {
@@ -915,7 +976,7 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
               .process_id = static_cast<int>(child),
               .error = events.error()};
     }
-    if (!options.runtime_library.empty() && !capture.runtime_handshake_received) {
+    if (!options.runtime_library.empty() && !capture.runtime.handshake_received) {
       return {.state = ProcessState::runtime_unavailable,
               .signal_number = signal_number,
               .process_id = static_cast<int>(child),
@@ -924,6 +985,7 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     return {.state = ProcessState::signaled,
             .signal_number = signal_number,
             .process_id = static_cast<int>(child),
+            .dropped_runtime_operations = capture.runtime.dropped_operations(),
             .error = {}};
   }
 

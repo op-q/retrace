@@ -22,6 +22,59 @@
 #error "RETRACE_RUNTIME_LIBRARY_PATH must name the runtime shared library"
 #endif
 
+// Layout assertions run at compile time so a mis-edited offset fails the build
+// rather than producing frames that decode into plausible wrong values. Each
+// field must begin exactly where its predecessor ends, leaving no gap that the
+// C encoder and C++ decoder could interpret differently.
+_Static_assert(RETRACE_RUNTIME_OPERATION_MONOTONIC_OFFSET ==
+                   RETRACE_RUNTIME_OPERATION_SEQUENCE_OFFSET + 8U,
+               "the sequence number occupies eight bytes");
+_Static_assert(RETRACE_RUNTIME_OPERATION_DURATION_OFFSET ==
+                   RETRACE_RUNTIME_OPERATION_MONOTONIC_OFFSET + 8U,
+               "the monotonic timestamp occupies eight bytes");
+_Static_assert(RETRACE_RUNTIME_OPERATION_THREAD_OFFSET ==
+                   RETRACE_RUNTIME_OPERATION_DURATION_OFFSET + 8U,
+               "the duration occupies eight bytes");
+_Static_assert(RETRACE_RUNTIME_OPERATION_ID_OFFSET ==
+                   RETRACE_RUNTIME_OPERATION_THREAD_OFFSET + 4U,
+               "the thread identifier occupies four bytes");
+_Static_assert(RETRACE_RUNTIME_OPERATION_FLAGS_OFFSET ==
+                   RETRACE_RUNTIME_OPERATION_ID_OFFSET + 2U,
+               "the operation identifier occupies two bytes");
+_Static_assert(RETRACE_RUNTIME_OPERATION_PREFIX_SIZE ==
+                   RETRACE_RUNTIME_OPERATION_FLAGS_OFFSET + 2U,
+               "the operation flags occupy two bytes");
+
+_Static_assert(RETRACE_RUNTIME_FILE_RESULT_OFFSET ==
+                   RETRACE_RUNTIME_OPERATION_PREFIX_SIZE,
+               "the file tail begins where the common prefix ends");
+_Static_assert(RETRACE_RUNTIME_FILE_ERRNO_OFFSET ==
+                   RETRACE_RUNTIME_FILE_RESULT_OFFSET + 8U,
+               "the result occupies eight bytes");
+_Static_assert(RETRACE_RUNTIME_FILE_DESCRIPTOR_OFFSET ==
+                   RETRACE_RUNTIME_FILE_ERRNO_OFFSET + 4U,
+               "the error number occupies four bytes");
+_Static_assert(RETRACE_RUNTIME_FILE_DIRECTORY_OFFSET ==
+                   RETRACE_RUNTIME_FILE_DESCRIPTOR_OFFSET + 4U,
+               "the descriptor occupies four bytes");
+_Static_assert(RETRACE_RUNTIME_FILE_OPEN_FLAGS_OFFSET ==
+                   RETRACE_RUNTIME_FILE_DIRECTORY_OFFSET + 4U,
+               "the directory descriptor occupies four bytes");
+_Static_assert(RETRACE_RUNTIME_FILE_MODE_OFFSET ==
+                   RETRACE_RUNTIME_FILE_OPEN_FLAGS_OFFSET + 4U,
+               "the open flags occupy four bytes");
+_Static_assert(RETRACE_RUNTIME_FILE_PATH_SIZE_OFFSET ==
+                   RETRACE_RUNTIME_FILE_MODE_OFFSET + 4U,
+               "the mode occupies four bytes");
+_Static_assert(RETRACE_RUNTIME_FILE_HEADER_SIZE ==
+                   RETRACE_RUNTIME_FILE_PATH_SIZE_OFFSET + 4U,
+               "the path byte count occupies four bytes");
+
+// A bounded path must never let one operation exceed the frame payload limit.
+_Static_assert(RETRACE_RUNTIME_FILE_HEADER_SIZE + RETRACE_RUNTIME_FILE_MAX_PATH_SIZE <
+                   RETRACE_RUNTIME_FRAME_MAX_PAYLOAD_SIZE,
+               "the largest file operation fits inside one frame");
+
 static int failure_count = 0;
 
 static void expect(const int condition, const char* const message) {

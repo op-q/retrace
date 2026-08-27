@@ -110,6 +110,14 @@ Signals:
       return writer.write_event(trace::EventType::process_exec, process_id);
     case process::ProcessEventType::runtime_handshake:
       return writer.write_event(trace::EventType::runtime_handshake, process_id);
+    case process::ProcessEventType::runtime_operation:
+      // The supervisor decodes and validates observed file operations, but the
+      // v1.0 trace has no event type for them yet: docs/trace-format.md still
+      // lists file events as planned. Recording them requires defining their
+      // on-disk payload, which is a separate format decision from the live
+      // protocol. Until then a recording omits them rather than inventing a
+      // layout that later traces would have to stay compatible with.
+      return {};
     case process::ProcessEventType::standard_output:
       return writer.write_event(trace::EventType::standard_output, process_id,
                                 event.bytes);

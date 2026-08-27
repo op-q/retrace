@@ -55,6 +55,86 @@ namespace {
          (static_cast<std::uint32_t>(source[3]) << 24U);
 }
 
+[[nodiscard]] std::uint64_t load_u64_le(const unsigned char* const source) {
+  std::uint64_t result = 0U;
+  for (unsigned int index = 0U; index < 8U; ++index) {
+    result |= static_cast<std::uint64_t>(source[index]) << (index * 8U);
+  }
+  return result;
+}
+
+[[nodiscard]] RuntimeReceiveResult protocol_error() {
+  return {.status = RuntimeReceiveStatus::error,
+          .error = std::make_error_code(std::errc::protocol_error)};
+}
+
+// Decodes one operation payload. Every field is validated against the declared
+// payload size before use: the target controls these bytes, so a length it
+// supplies must never be trusted to address memory.
+[[nodiscard]] RuntimeReceiveResult decode_operation(const unsigned char* const payload,
+                                                    const std::uint32_t payload_size,
+                                                    RuntimeOperation& operation) {
+  if (payload_size < RETRACE_RUNTIME_OPERATION_PREFIX_SIZE) {
+    return protocol_error();
+  }
+
+  const auto flags = load_u16_le(&payload[RETRACE_RUNTIME_OPERATION_FLAGS_OFFSET]);
+  if ((flags & ~RETRACE_RUNTIME_OPERATION_FLAGS_DEFINED) != 0U) {
+    return protocol_error();
+  }
+
+  // An unrecognized operation identifier selects an unknown tail layout, so the
+  // frame cannot be decoded safely and is rejected rather than guessed at.
+  RuntimeOperationKind kind{};
+  switch (load_u16_le(&payload[RETRACE_RUNTIME_OPERATION_ID_OFFSET])) {
+    case RETRACE_RUNTIME_OPERATION_OPEN:
+      kind = RuntimeOperationKind::file_open;
+      break;
+    case RETRACE_RUNTIME_OPERATION_OPENAT:
+      kind = RuntimeOperationKind::file_openat;
+      break;
+    case RETRACE_RUNTIME_OPERATION_CLOSE:
+      kind = RuntimeOperationKind::file_close;
+      break;
+    default:
+      return protocol_error();
+  }
+
+  // Every operation defined in version 1.0 carries the file tail.
+  if (payload_size < RETRACE_RUNTIME_FILE_HEADER_SIZE) {
+    return protocol_error();
+  }
+  const auto path_size = load_u32_le(&payload[RETRACE_RUNTIME_FILE_PATH_SIZE_OFFSET]);
+  if (path_size > RETRACE_RUNTIME_FILE_MAX_PATH_SIZE ||
+      path_size != payload_size - RETRACE_RUNTIME_FILE_HEADER_SIZE) {
+    return protocol_error();
+  }
+
+  operation.sequence = load_u64_le(&payload[RETRACE_RUNTIME_OPERATION_SEQUENCE_OFFSET]);
+  operation.monotonic_nanoseconds =
+      load_u64_le(&payload[RETRACE_RUNTIME_OPERATION_MONOTONIC_OFFSET]);
+  operation.duration_nanoseconds =
+      load_u64_le(&payload[RETRACE_RUNTIME_OPERATION_DURATION_OFFSET]);
+  operation.thread_id = load_u32_le(&payload[RETRACE_RUNTIME_OPERATION_THREAD_OFFSET]);
+  operation.kind = kind;
+  operation.path_truncated =
+      (flags & RETRACE_RUNTIME_OPERATION_FLAG_PATH_TRUNCATED) != 0U;
+  operation.result = static_cast<std::int64_t>(
+      load_u64_le(&payload[RETRACE_RUNTIME_FILE_RESULT_OFFSET]));
+  operation.error_number = load_u32_le(&payload[RETRACE_RUNTIME_FILE_ERRNO_OFFSET]);
+  operation.descriptor = static_cast<std::int32_t>(
+      load_u32_le(&payload[RETRACE_RUNTIME_FILE_DESCRIPTOR_OFFSET]));
+  operation.directory = static_cast<std::int32_t>(
+      load_u32_le(&payload[RETRACE_RUNTIME_FILE_DIRECTORY_OFFSET]));
+  operation.open_flags = load_u32_le(&payload[RETRACE_RUNTIME_FILE_OPEN_FLAGS_OFFSET]);
+  operation.mode = load_u32_le(&payload[RETRACE_RUNTIME_FILE_MODE_OFFSET]);
+  operation.path.assign(
+      reinterpret_cast<const char*>(&payload[RETRACE_RUNTIME_FILE_HEADER_SIZE]),
+      path_size);
+
+  return {.status = RuntimeReceiveStatus::operation, .error = {}};
+}
+
 }  // namespace
 
 std::error_code RuntimeChannel::create(RuntimeChannel& result) {
@@ -106,13 +186,17 @@ int RuntimeChannel::make_target_descriptor_inheritable() const noexcept {
   return result < 0 ? errno : 0;
 }
 
-RuntimeReceiveResult RuntimeChannel::receive() const {
+RuntimeReceiveResult RuntimeChannel::receive(RuntimeOperation& operation) const {
   // MSG_TRUNC asks Linux to report a packet's real size even if the fixed buffer
   // is too small, allowing oversized packets to be rejected deterministically.
   constexpr auto maximum_frame_size =
       static_cast<std::size_t>(RETRACE_RUNTIME_FRAME_HEADER_SIZE) +
       static_cast<std::size_t>(RETRACE_RUNTIME_FRAME_MAX_PAYLOAD_SIZE);
-  std::array<unsigned char, maximum_frame_size> frame{};
+  // Value-initializing this buffer would re-zero 64 KiB on every packet, which
+  // becomes measurable once operation frames arrive at target speed. Static
+  // thread-local storage is zeroed once per thread instead, and each packet is
+  // read only up to the length recvmsg(2) reports.
+  static thread_local std::array<unsigned char, maximum_frame_size> frame;
   iovec frame_buffer{.iov_base = frame.data(), .iov_len = frame.size()};
   msghdr message{};
   message.msg_iov = &frame_buffer;
@@ -180,12 +264,18 @@ RuntimeReceiveResult RuntimeChannel::receive() const {
     return {.status = RuntimeReceiveStatus::error,
             .error = std::make_error_code(std::errc::protocol_error)};
   }
-  if (type != RETRACE_RUNTIME_MESSAGE_HANDSHAKE || payload_size != 0U) {
-    return {.status = RuntimeReceiveStatus::error,
-            .error = std::make_error_code(std::errc::protocol_error)};
+  if (type == RETRACE_RUNTIME_MESSAGE_HANDSHAKE) {
+    if (payload_size != 0U) {
+      return protocol_error();
+    }
+    return {.status = RuntimeReceiveStatus::handshake, .error = {}};
+  }
+  if (type == RETRACE_RUNTIME_MESSAGE_OPERATION) {
+    return decode_operation(&frame[RETRACE_RUNTIME_FRAME_HEADER_SIZE], payload_size,
+                            operation);
   }
 
-  return {.status = RuntimeReceiveStatus::handshake, .error = {}};
+  return protocol_error();
 }
 
 }  // namespace retrace::process
