@@ -63,19 +63,32 @@ without allowing a descendant that inherited a write end to extend collection
 forever. Descendants share the target process group for signal delivery, but
 RETRACE still waits for and reports only the direct target.
 
+Because that group is not the one the terminal already considers foreground, a
+target reading or writing the controlling terminal would be stopped by `SIGTTIN`
+or `SIGTTOU` and never resume. RETRACE therefore lends the terminal to the
+target group with `tcsetpgrp()` for the duration of the run and returns it once
+the target is reaped. Both the parent and the child perform the handover so no
+ordering leaves the target briefly in the background. Having no controlling
+terminal, or RETRACE not being in the foreground itself, is an ordinary
+condition: the run proceeds without job control rather than failing, and the
+terminal of an unrelated foreground job is never taken.
+
 The current launch sequence is:
 
 1. Parse the command and validate the selected working directory.
 2. Locate the runtime unless disabled, then create the trace, stdout/stderr
    pipes, launch-status pipe, runtime channel, and signal source.
 3. Call `fork()`.
-4. In the child, create the target process group, restore the inherited signal
-   mask, change directory, redirect descriptors, make the target runtime
-   endpoint inheritable, and call `execvpe()` with an explicitly rebuilt
-   environment that prepends RETRACE to any caller `LD_PRELOAD` entries.
-5. In the parent, close unused pipe ends, record `process.start`, poll streams
-   with the runtime and signal sources, validate any handshake, forward signals
-   with `kill(-pgid, signal)`, and check completion with `waitpid()`.
+4. In the child, create the target process group, claim the controlling
+   terminal, restore the inherited signal mask, change directory, redirect
+   descriptors, make the target runtime endpoint inheritable, and call
+   `execvpe()` with an explicitly rebuilt environment that prepends RETRACE to
+   any caller `LD_PRELOAD` entries.
+5. In the parent, mirror the target process group, hand over the controlling
+   terminal, close unused pipe ends, record `process.start`, poll streams with
+   the runtime and signal sources, validate any handshake, forward signals with
+   `kill(-pgid, signal)` followed by `kill(-pgid, SIGCONT)`, and check
+   completion with `waitpid()`.
 6. Finish all complete frame writes and close the trace. Version 1.0 has no
    footer or durable-finalization record.
 

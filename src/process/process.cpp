@@ -143,6 +143,83 @@ class ForwardedSignals final {
   bool mask_changed_ = false;
 };
 
+// tcsetpgrp(3) called from a background process group raises SIGTTOU at the
+// caller, which is the very stop this helper exists to avoid. Blocking the
+// signal across the call is the standard job-control guard. Only async-signal-
+// safe calls are used so the forked child can reuse it before exec.
+[[nodiscard]] bool set_foreground_group(const int terminal,
+                                        const pid_t group) noexcept {
+  sigset_t blocked{};
+  sigset_t previous{};
+  if (::sigemptyset(&blocked) < 0 || ::sigaddset(&blocked, SIGTTOU) < 0) {
+    return false;
+  }
+  if (::sigprocmask(SIG_BLOCK, &blocked, &previous) < 0) {
+    return false;
+  }
+
+  const bool changed = ::tcsetpgrp(terminal, group) == 0;
+  [[maybe_unused]] const auto restored = ::sigprocmask(SIG_SETMASK, &previous, nullptr);
+  return changed;
+}
+
+// A target leading its own process group is in the background, so the kernel
+// stops it with SIGTTIN or SIGTTOU as soon as it touches the controlling
+// terminal. RETRACE lends the terminal to the target's group for the run and
+// takes it back afterwards. Having no controlling terminal, or being in the
+// background itself, are ordinary conditions: the run proceeds without job
+// control rather than failing.
+class TerminalForeground final {
+ public:
+  TerminalForeground() = default;
+  ~TerminalForeground() { restore(); }
+
+  TerminalForeground(const TerminalForeground&) = delete;
+  TerminalForeground& operator=(const TerminalForeground&) = delete;
+
+  void open_controlling_terminal() noexcept {
+    // /dev/tty resolves the controlling terminal whatever the standard
+    // descriptors were redirected to.
+    const int descriptor = ::open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (descriptor < 0) {
+      return;
+    }
+
+    terminal_.reset(descriptor);
+    original_group_ = ::tcgetpgrp(terminal_.get());
+    if (original_group_ < 0 || original_group_ != ::getpgrp()) {
+      // Stealing the terminal from an unrelated foreground job would stop that
+      // job instead, so leave job control alone.
+      original_group_ = -1;
+      terminal_.reset();
+    }
+  }
+
+  [[nodiscard]] bool available() const noexcept { return terminal_.get() >= 0; }
+  [[nodiscard]] int descriptor() const noexcept { return terminal_.get(); }
+
+  void grant(const pid_t group) noexcept {
+    if (!available() || group <= 0) {
+      return;
+    }
+    granted_ = set_foreground_group(terminal_.get(), group);
+  }
+
+  void restore() noexcept {
+    if (!granted_) {
+      return;
+    }
+    granted_ = false;
+    [[maybe_unused]] const bool returned =
+        set_foreground_group(terminal_.get(), original_group_);
+  }
+
+ private:
+  UniqueFd terminal_;
+  pid_t original_group_ = -1;
+  bool granted_ = false;
+};
+
 void send_launch_error(const int descriptor, const int error_number) noexcept {
   // The close-on-exec launch pipe is a tiny parent/child protocol: either the
   // child writes one errno, or successful exec closes the descriptor at EOF.
@@ -338,6 +415,16 @@ struct ChildPollResult {
     } while (kill_result < 0 && errno == EINTR);
 
     if (kill_result == 0) {
+      // A stopped target never acts on a terminating signal; it stays pending
+      // until something resumes the process. SIGCONT after the signal lets the
+      // delivery the target already has take effect. Failure here is not worth
+      // reporting: the terminating signal is queued either way.
+      int continue_result = -1;
+      do {
+        continue_result = ::kill(-process_group, SIGCONT);
+      } while (continue_result < 0 && errno == EINTR);
+      static_cast<void>(continue_result);
+
       events.send(ProcessEventType::signal_forwarded, signal_number);
     } else if (errno != ESRCH) {
       return system_error(errno);
@@ -642,6 +729,11 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     return {.state = ProcessState::supervisor_failed, .error = error};
   }
 
+  // Opened before fork so both sides share one descriptor for the terminal
+  // handover. Its destructor returns the terminal on every exit path.
+  TerminalForeground terminal;
+  terminal.open_controlling_terminal();
+
   const pid_t child = ::fork();
   if (child < 0) {
     return {.state = ProcessState::supervisor_failed, .error = system_error(errno)};
@@ -656,6 +748,13 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     if (::setpgid(0, 0) < 0) {
       send_launch_error(launch_errors.write_descriptor(), errno);
       ::_exit(127);
+    }
+    // Both sides claim the terminal because either ordering would otherwise
+    // leave a window where the target is in the background and a terminal read
+    // would stop it. Whichever call lands second is harmless.
+    if (terminal.available()) {
+      [[maybe_unused]] const bool claimed =
+          set_foreground_group(terminal.descriptor(), ::getpid());
     }
     if (const auto error = forwarded_signals.restore_mask()) {
       send_launch_error(launch_errors.write_descriptor(), error.value());
@@ -697,6 +796,16 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     ::_exit(127);
   }
 
+  // Mirrors the child's own setpgid so the terminal is never handed to a group
+  // that does not exist yet. EACCES means the child already exec'd and ESRCH
+  // that it is gone; both leave the group correct or irrelevant.
+  if (::setpgid(child, child) < 0 && errno != EACCES && errno != ESRCH) {
+    return {.state = ProcessState::supervisor_failed,
+            .process_id = static_cast<int>(child),
+            .error = system_error(errno)};
+  }
+  terminal.grant(child);
+
   launch_errors.close_write_end();
   standard_output.close_write_end();
   standard_error.close_write_end();
@@ -719,6 +828,7 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
       capture_output_and_wait(child, standard_output, standard_error, runtime_channel,
                               forwarded_signals.descriptor(), events);
 
+  terminal.restore();
   const auto signal_restore_error = forwarded_signals.restore_mask();
 
   if (capture.wait_error) {

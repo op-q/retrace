@@ -189,7 +189,9 @@ retrace run --kill-after 5s --signal SIGTERM -- ./server
 ```
 
 RETRACE currently receives `SIGINT` and `SIGTERM` through a pollable signal
-source and forwards them to the target process group. A successful forwarding
+source and forwards them to the target process group, each followed by
+`SIGCONT`. A stopped target never acts on a terminating signal, so without that
+resume it would keep the signal pending and stay alive. A successful forwarding
 is recorded as `signal.receive`; the target's eventual signal termination is a
 separate `process.signal` event. Source classification, `--kill-after`, a
 graceful-exit period, escalation, and scenario-driven signals remain planned.
