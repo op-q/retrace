@@ -4,7 +4,12 @@
 // its payloads, and falls back to the raw syscall rather than failing a call it
 // could not resolve.
 
+// dlsym(3)'s RTLD_NEXT handle is a GNU extension, and defining this feature-test
+// macro is the documented way to request it. The name is reserved to the
+// implementation by design, which is exactly why the check is silenced here
+// rather than the macro renamed.
 #ifndef _GNU_SOURCE
+// NOLINTNEXTLINE(bugprone-reserved-identifier,cert-dcl37-c,cert-dcl51-cpp)
 #define _GNU_SOURCE
 #endif
 
@@ -168,6 +173,10 @@ static uint32_t current_thread_identifier(void) {
   return (uint32_t)syscall(SYS_gettid);
 }
 
+// The int parameters below describe one completed call and are always passed
+// together from a single recording site, so the readability benefit of a struct
+// does not outweigh adding an argument object on every interposed call.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 static void emit_file_operation(const uint16_t operation_id, const int64_t result,
                                 const int error_number, const int descriptor,
                                 const int directory, const uint32_t open_flags,
@@ -242,6 +251,10 @@ static void emit_file_operation(const uint16_t operation_id, const int64_t resul
   store_u32_le(&payload[RETRACE_RUNTIME_FILE_MODE_OFFSET], mode);
   store_u32_le(&payload[RETRACE_RUNTIME_FILE_PATH_SIZE_OFFSET], path_size);
   if (path_size > 0U) {
+    // path_size is already bounded by RETRACE_RUNTIME_FILE_MAX_PATH_SIZE above,
+    // and the frame buffer reserves exactly that much room. The bounds-checked
+    // C11 Annex K alternative the analyzer suggests is not provided by glibc.
+    // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     memcpy(&payload[RETRACE_RUNTIME_FILE_HEADER_SIZE], path, (size_t)path_size);
   }
 
@@ -275,6 +288,11 @@ static mode_t creation_mode(const int flags, va_list arguments) {
   return (mode_t)va_arg(arguments, unsigned int);
 }
 
+// Each interposed definition below replaces a libc function whose own
+// declaration names its parameters with implementation-reserved identifiers such
+// as __fd. Copying those names into these definitions would make the hooks
+// harder to read without changing what they do.
+// NOLINTBEGIN(readability-inconsistent-declaration-parameter-name)
 RETRACE_EXPORT int open(const char* const path, const int flags, ...) {
   va_list arguments;
   va_start(arguments, flags);
@@ -361,6 +379,7 @@ RETRACE_EXPORT int close(const int descriptor) {
   errno = saved_errno;
   return result;
 }
+// NOLINTEND(readability-inconsistent-declaration-parameter-name)
 
 static void make_descriptor_close_on_exec(const int descriptor) {
   // The supervisor clears this flag for the first target exec. Restoring it in
