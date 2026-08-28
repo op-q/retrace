@@ -29,6 +29,19 @@ constexpr std::array<std::byte, 8> trace_magic{
 constexpr std::size_t trace_header_prefix_size = 16U;
 constexpr std::uint32_t event_header_after_length_size = 24U;
 
+// File-event payload offsets, held independently from the encoder's copy so a
+// one-sided edit fails a compatibility test instead of silently agreeing.
+constexpr std::size_t file_event_completion_offset = 0U;
+constexpr std::size_t file_event_duration_offset = 8U;
+constexpr std::size_t file_event_result_offset = 16U;
+constexpr std::size_t file_event_errno_offset = 24U;
+constexpr std::size_t file_event_descriptor_offset = 28U;
+constexpr std::size_t file_event_directory_offset = 32U;
+constexpr std::size_t file_event_open_flags_offset = 36U;
+constexpr std::size_t file_event_mode_offset = 40U;
+constexpr std::size_t file_event_flags_offset = 44U;
+constexpr std::size_t file_event_path_size_offset = 48U;
+
 class TraceErrorCategory final : public std::error_category {
  public:
   [[nodiscard]] const char* name() const noexcept override { return "retrace.trace"; }
@@ -193,6 +206,9 @@ class HeaderCursor final {
     case EventType::process_launch_failure:
     case EventType::signal_receive:
     case EventType::runtime_handshake:
+    case EventType::file_open:
+    case EventType::file_close:
+    case EventType::runtime_operations_dropped:
       return true;
   }
   return false;
@@ -216,11 +232,68 @@ class HeaderCursor final {
     case EventType::process_launch_failure:
     case EventType::signal_receive:
       return event.payload.size() == sizeof(std::uint32_t);
+    case EventType::file_open:
+    case EventType::file_close: {
+      FileEvent decoded;
+      return decode_file_event(static_cast<EventType>(event.type), event.payload,
+                               decoded);
+    }
+    case EventType::runtime_operations_dropped:
+      return event.payload.size() == sizeof(std::uint64_t);
   }
   return false;
 }
 
 }  // namespace
+
+bool decode_file_event(const EventType type, const std::string_view payload,
+                       FileEvent& result) {
+  // Trace bytes are untrusted. The stored path length is checked against both
+  // its own bound and the actual payload size before it can address any byte,
+  // so a length the file supplies can never reach past the buffer.
+  if (type != EventType::file_open && type != EventType::file_close) {
+    return false;
+  }
+  if (payload.size() < file_event_header_size) {
+    return false;
+  }
+
+  const auto* const bytes = reinterpret_cast<const std::byte*>(payload.data());
+  const auto path_size = decode_u32(bytes + file_event_path_size_offset);
+  if (path_size > maximum_file_event_path_size ||
+      path_size != payload.size() - file_event_header_size) {
+    return false;
+  }
+
+  const auto flags = decode_u32(bytes + file_event_flags_offset);
+  if ((flags & ~file_event_defined_flags) != 0U) {
+    return false;
+  }
+  // A close names a descriptor, never a path. Accepting path bytes or a
+  // path-derived flag here would mean the encoder and this decoder disagree
+  // about which operation the frame describes.
+  if (type == EventType::file_close && (path_size != 0U || flags != 0U)) {
+    return false;
+  }
+
+  result.completion_offset_nanoseconds =
+      decode_u64(bytes + file_event_completion_offset);
+  result.duration_nanoseconds = decode_u64(bytes + file_event_duration_offset);
+  // C++20 fixes signed integers as two's complement, so these conversions
+  // recover exactly the value the encoder stored.
+  result.result =
+      static_cast<std::int64_t>(decode_u64(bytes + file_event_result_offset));
+  result.error_number = decode_u32(bytes + file_event_errno_offset);
+  result.descriptor =
+      static_cast<std::int32_t>(decode_u32(bytes + file_event_descriptor_offset));
+  result.directory =
+      static_cast<std::int32_t>(decode_u32(bytes + file_event_directory_offset));
+  result.open_flags = decode_u32(bytes + file_event_open_flags_offset);
+  result.mode = decode_u32(bytes + file_event_mode_offset);
+  result.flags = flags;
+  result.path = payload.substr(file_event_header_size, path_size);
+  return true;
+}
 
 std::error_code make_error_code(const TraceErrc error) noexcept {
   return {static_cast<int>(error), trace_error_category};

@@ -22,9 +22,11 @@ or structurally validate v1.0 trace files.
 - `--working-directory PATH` is resolved and checked before trace creation; the
   child independently changes directory before replacing its process image.
 - RETRACE concurrently relays stdout and stderr without storing a complete copy.
-- `--output TRACE` records command arguments, working directory, lifecycle, and
-  stdout/stderr chunks. It does not record environment variables, file contents,
-  or network payloads.
+- `--output TRACE` records command arguments, working directory, lifecycle,
+  stdout/stderr chunks, and the file operations the injected runtime observed.
+  A recorded operation includes the path the target passed, which may itself be
+  sensitive. It does not record environment variables, file contents, or network
+  payloads.
 - A trace path requests mode `0600` (a restrictive umask may remove more
   permissions) and uses close-on-exec, exclusive creation, and no final-component
   symlink following. Existing paths are not overwritten, and the target is not
@@ -72,9 +74,15 @@ Static binaries, secure-execution targets such as setuid programs, direct
 syscalls, and some language runtimes may bypass `LD_PRELOAD`. When a requested
 handshake is absent, RETRACE reports instrumentation as unavailable after
 observing the target result; the target may already have performed side effects.
-Before operation interposition ships, hooks must additionally prevent recursion
-and minimize allocation and locking. Runtime instrumentation does not provide
-container-grade isolation.
+The interposition hooks use a thread-local recursion guard, allocate nothing,
+take no locks, and restore the caller's `errno`. They read a path only after the
+real call accepted the pointer, so a target that passed an unmapped address
+receives `EFAULT` rather than a fault the runtime introduced, and they fall back
+to the raw syscall when symbol resolution fails. A target that closes the channel
+descriptor stops being instrumented rather than having that close recorded,
+because the kernel reuses the lowest free descriptor and a later target open
+could otherwise receive protocol frames into its own file. Runtime
+instrumentation does not provide container-grade isolation.
 
 ## Repository secret policy
 

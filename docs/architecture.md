@@ -10,8 +10,9 @@ target leads a process group; RETRACE synchronously receives `SIGINT` and
 also validate a trace's v1.0 structure and render its complete events as a
 terminal timeline. Ordinary runs automatically preload the C runtime into
 supported dynamic targets, require its validated handshake, and allow an
-explicit `--no-runtime` opt-out. Libc-operation interposition, trace export, and
-fault injection are not yet implemented.
+explicit `--no-runtime` opt-out. The loaded runtime interposes the selected file
+operations and records them as trace events. Socket and read/write
+instrumentation, trace export, and fault injection are not yet implemented.
 
 The target architecture will supervise the command, record selected runtime
 events, and write them to a trace. Later it will reproduce explicitly configured
@@ -115,15 +116,18 @@ was requested, an absent handshake is reported as unavailable instrumentation
 after the direct target's result is observed. `--no-runtime` removes the owned
 channel and does not alter `LD_PRELOAD`.
 
+The runtime interposes `open`, `open64`, `openat`, `openat64`, and `close`. Each
+hook resolves the real symbol with `dlsym(RTLD_NEXT, ...)`, falls back to the raw
+syscall when resolution fails, uses a thread-local recursion guard, preserves
+`errno`, and emits one compact framed event through the C-compatible protocol.
+The supervisor validates each frame and translates it into a `file.open` or
+`file.close` trace event. Losing the channel is not fatal: the target continues
+without instrumentation.
+
 The runtime will next:
 
-- interpose selected libc calls;
-- resolve the real symbol with `dlsym(RTLD_NEXT, ...)`;
-- match bounded fault rules;
-- emit compact events through a framed C-compatible protocol;
-- use thread-local recursion guards;
-- preserve `errno`; and
-- normally let the target continue if tracing becomes unavailable.
+- interpose `connect` and selected read/write metadata; and
+- match bounded fault rules.
 
 It cannot reliably instrument static binaries, setuid binaries, direct syscalls,
 or every language runtime. RETRACE must report these limits honestly.

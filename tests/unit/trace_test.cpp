@@ -430,6 +430,177 @@ void test_event_payload_size_boundary(TestContext& test) {
               "only the boundary-sized payload is appended");
 }
 
+// Locates the payload of the first event frame. The header payload size is
+// stored at a fixed offset, so the first frame begins immediately after it.
+[[nodiscard]] std::size_t first_frame_offset(const std::vector<unsigned char>& bytes) {
+  return 16U + read_u32(bytes, 12U);
+}
+
+void test_file_event_encoding(TestContext& test) {
+  TemporaryPath path;
+  test.expect(!path.value().empty(),
+              "a temporary path is available for file-event encoding");
+  constexpr std::array arguments{std::string_view{"synthetic-program"}};
+  constexpr std::string_view synthetic_path = "/synthetic/observed.txt";
+
+  const retrace::trace::FileEvent open_fields{
+      .completion_offset_nanoseconds = 111U,
+      .duration_nanoseconds = 222U,
+      .result = 7,
+      .error_number = 0U,
+      .descriptor = 7,
+      .directory = 5,
+      .open_flags = 0x241U,
+      .mode = 0600U,
+      .flags = retrace::trace::file_event_flag_relative_to_directory,
+      .path = synthetic_path,
+  };
+
+  {
+    retrace::trace::Writer writer;
+    const auto creation =
+        retrace::trace::Writer::create(path.value(), metadata_for(arguments), writer);
+    test.expect(!creation.error, "the file-event trace is created");
+
+    test.expect(!writer.write_file_event(retrace::trace::EventType::file_open, 42U, 99U,
+                                         open_fields),
+                "a file-open frame is written");
+
+    const auto invalid_argument = std::make_error_code(std::errc::invalid_argument);
+    test.expect(writer.write_file_event(retrace::trace::EventType::process_start, 42U,
+                                        99U, open_fields) == invalid_argument,
+                "write_file_event rejects an event type that is not a file event");
+    test.expect(writer.write_file_event(retrace::trace::EventType::file_close, 42U, 99U,
+                                        open_fields) == invalid_argument,
+                "a close carrying a path is rejected");
+
+    retrace::trace::FileEvent undefined_flag = open_fields;
+    undefined_flag.flags = ~retrace::trace::file_event_defined_flags;
+    test.expect(writer.write_file_event(retrace::trace::EventType::file_open, 42U, 99U,
+                                        undefined_flag) == invalid_argument,
+                "an undefined payload flag is rejected");
+
+    const std::string oversized(
+        static_cast<std::size_t>(retrace::trace::maximum_file_event_path_size) + 1U,
+        'p');
+    retrace::trace::FileEvent oversized_path = open_fields;
+    oversized_path.path = oversized;
+    test.expect(writer.write_file_event(retrace::trace::EventType::file_open, 42U, 99U,
+                                        oversized_path) ==
+                    std::make_error_code(std::errc::message_size),
+                "a path above the recorded bound is rejected rather than truncated");
+    test.expect(writer.is_open(), "rejected file events leave the writer usable");
+  }
+
+  const auto bytes = read_file(path.value());
+  test.expect(count_complete_frames(bytes) == 1U,
+              "rejected file events append no frames");
+
+  const auto frame = first_frame_offset(bytes);
+  const auto payload = frame + 28U;
+  test.expect(read_u16(bytes, frame + 4U) ==
+                  static_cast<std::uint16_t>(retrace::trace::EventType::file_open),
+              "the frame stores the file-open event identifier");
+  test.expect(read_u32(bytes, frame + 20U) == 99U,
+              "the frame stores the reporting target thread identifier");
+  test.expect(read_u32(bytes, frame + 24U) ==
+                  retrace::trace::file_event_header_size + synthetic_path.size(),
+              "the payload size covers the fixed header and the stored path");
+
+  // Each field is read back at its own offset so a layout change fails here
+  // rather than silently producing plausible values.
+  test.expect(read_u64(bytes, payload + 0U) == 111U, "the completion offset is stored");
+  test.expect(read_u64(bytes, payload + 8U) == 222U, "the duration is stored");
+  test.expect(read_u64(bytes, payload + 16U) == 7U, "the call result is stored");
+  test.expect(read_u32(bytes, payload + 24U) == 0U, "the error number is stored");
+  test.expect(read_u32(bytes, payload + 28U) == 7U, "the descriptor is stored");
+  test.expect(read_u32(bytes, payload + 32U) == 5U,
+              "the directory descriptor is stored");
+  test.expect(read_u32(bytes, payload + 36U) == 0x241U, "the open flags are stored");
+  test.expect(read_u32(bytes, payload + 40U) == 0600U, "the creation mode is stored");
+  test.expect(read_u32(bytes, payload + 44U) ==
+                  retrace::trace::file_event_flag_relative_to_directory,
+              "the payload flags are stored");
+  test.expect(read_u32(bytes, payload + 48U) == synthetic_path.size(),
+              "the path size is stored");
+
+  const auto* const stored_path = reinterpret_cast<const char*>(
+      bytes.data() + payload + retrace::trace::file_event_header_size);
+  test.expect(std::string_view{stored_path, synthetic_path.size()} == synthetic_path,
+              "the path bytes follow the fixed payload header");
+
+  // A negative result must survive the round trip as its exact value, which is
+  // what lets a consumer tell a failed call from a descriptor of zero.
+  retrace::trace::FileEvent decoded;
+  const std::string_view encoded_payload{
+      reinterpret_cast<const char*>(bytes.data() + payload),
+      retrace::trace::file_event_header_size + synthetic_path.size()};
+  test.expect(retrace::trace::decode_file_event(retrace::trace::EventType::file_open,
+                                                encoded_payload, decoded),
+              "the writer's own bytes decode as a valid file event");
+  test.expect(decoded.result == 7 && decoded.path == synthetic_path,
+              "decoding recovers the encoded result and path");
+}
+
+void test_close_and_dropped_operation_events(TestContext& test) {
+  TemporaryPath path;
+  test.expect(!path.value().empty(),
+              "a temporary path is available for close and drop events");
+  constexpr std::array arguments{std::string_view{"synthetic-program"}};
+
+  const retrace::trace::FileEvent close_fields{
+      .completion_offset_nanoseconds = 10U,
+      .duration_nanoseconds = 20U,
+      .result = -1,
+      .error_number = 9U,
+      .descriptor = -1,
+      .directory = 0,
+      .open_flags = 0U,
+      .mode = 0U,
+      .flags = 0U,
+      .path = {},
+  };
+
+  {
+    retrace::trace::Writer writer;
+    const auto creation =
+        retrace::trace::Writer::create(path.value(), metadata_for(arguments), writer);
+    test.expect(!creation.error, "the close-event trace is created");
+    test.expect(!writer.write_file_event(retrace::trace::EventType::file_close, 42U,
+                                         42U, close_fields),
+                "a file-close frame is written");
+    test.expect(!writer.write_dropped_operations_event(42U, 5U),
+                "a dropped-operation frame is written");
+  }
+
+  const auto bytes = read_file(path.value());
+  test.expect(count_complete_frames(bytes) == 2U, "both closing frames are appended");
+
+  const auto frame = first_frame_offset(bytes);
+  const auto payload = frame + 28U;
+  test.expect(read_u32(bytes, frame + 24U) == retrace::trace::file_event_header_size,
+              "a close payload is exactly the fixed header");
+  test.expect(read_u32(bytes, payload + 48U) == 0U, "a close stores no path");
+
+  retrace::trace::FileEvent decoded;
+  const std::string_view close_payload{
+      reinterpret_cast<const char*>(bytes.data() + payload),
+      retrace::trace::file_event_header_size};
+  test.expect(retrace::trace::decode_file_event(retrace::trace::EventType::file_close,
+                                                close_payload, decoded),
+              "a close payload decodes as a valid file event");
+  test.expect(decoded.result == -1 && decoded.descriptor == -1,
+              "negative values survive the two's complement round trip");
+
+  const auto drop_frame = frame + 4U + read_u32(bytes, frame);
+  test.expect(read_u16(bytes, drop_frame + 4U) ==
+                  static_cast<std::uint16_t>(
+                      retrace::trace::EventType::runtime_operations_dropped),
+              "the closing frame records dropped operations");
+  test.expect(read_u64(bytes, drop_frame + 28U) == 5U,
+              "the dropped-operation count is stored as a 64-bit value");
+}
+
 }  // namespace
 
 int main() {
@@ -438,5 +609,7 @@ int main() {
   test_argument_count_boundaries(test);
   test_event_schema_validation(test);
   test_event_payload_size_boundary(test);
+  test_file_event_encoding(test);
+  test_close_and_dropped_operation_events(test);
   return test.result();
 }

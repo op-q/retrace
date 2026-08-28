@@ -36,8 +36,11 @@ later descendant tracking.
 Automatic loading requires exactly one handshake. Static, setuid, and other
 loader-restricted targets may still run, but RETRACE reports instrumentation as
 unavailable after observing their result. Channel-only process-API calls keep
-the handshake optional for focused transport tests. Libc interposition and
-operation events remain later v0.2 work.
+the handshake optional for focused transport tests.
+
+The runtime interposes `open`, `open64`, `openat`, `openat64`, and `close`, and
+reports each completed call as an operation message. `connect` and read/write
+metadata remain later v0.2 work.
 
 ## Frame header
 
@@ -61,13 +64,74 @@ packet, or a payload larger than the limit before decoding it.
 proves only that the runtime loaded far enough to send the frame; it does not
 prove that every requested interposition hook is available.
 
+## Operation messages
+
+`operation` is message type `2`. Its payload is a fixed common prefix followed by
+a tail chosen by the operation identifier, so later socket and read/write
+operations can reuse the prefix decoder without reinterpreting the fields every
+operation shares.
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | sequence number |
+| 8 | 8 | `CLOCK_MONOTONIC` completion time in nanoseconds |
+| 16 | 8 | call duration in nanoseconds |
+| 24 | 4 | thread identifier from `gettid` |
+| 28 | 2 | operation identifier |
+| 30 | 2 | operation flags |
+
+Operation identifiers are `1` for `open`, `2` for `openat`, and `3` for `close`.
+A decoder that does not recognize one must reject the frame rather than guess at
+its tail layout, and the supervisor does. Operation flag `0x1` marks a truncated
+path; it is unrelated to the frame header's flags field, which stays zero.
+
+Every operation defined in version 1.0 carries the file tail:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 32 | 8 | `i64` return value |
+| 40 | 4 | saved `errno`, meaningful only when the return value is negative |
+| 44 | 4 | `i32` descriptor: a successful open result, or a close argument |
+| 48 | 4 | `i32` directory descriptor, meaningful only for `openat` |
+| 52 | 4 | open flags |
+| 56 | 4 | creation mode |
+| 60 | 4 | path size |
+| 64 | variable | path bytes, without a terminator, at most 4096 |
+
+The supervisor validates every field against the declared payload size before
+using it. A target controls these bytes, so a length it supplies is never
+trusted to address memory.
+
+The sequence number counts operations the runtime attempted to report, not
+operations the supervisor received. Because the channel is nonblocking and
+bounded, a full socket drops frames, and a gap in this counter is the only
+evidence that loss occurred. The supervisor compares the highest number it saw
+against the number of packets it received: each thread takes its sequence before
+its own send, so two threads can deliver 6 before 5 without either being lost,
+and a running "expected next" counter would misreport ordinary concurrency as
+loss. A nonzero result is recorded as `runtime.operations_dropped` rather than
+presenting an incomplete record as complete.
+
+Three safety properties govern the hooks themselves:
+
+- each hook resolves its real implementation with `dlsym(RTLD_NEXT, ...)`, falls
+  back to the raw syscall if resolution fails, and restores the caller's `errno`,
+  so a target keeps working even when instrumentation cannot;
+- a path is read only after the real call accepted the pointer, so a target that
+  passed an unmapped address receives `EFAULT` rather than a fault the runtime
+  introduced; and
+- closing the channel descriptor disables emission instead of being recorded.
+  The kernel reuses the lowest free descriptor, so a later target open could
+  otherwise receive protocol frames into its own file.
+
 ## Transport rules
 
 One `send()` call carries one complete frame. `SOCK_SEQPACKET` preserves frame
 boundaries, and the runtime uses `MSG_NOSIGNAL` so loss of the supervisor does
 not terminate the target. `MSG_DONTWAIT` prevents a full or misconfigured channel
-from blocking target startup. The runtime does not close the inherited
-descriptor; later operation hooks will reuse it in the current target image.
+from blocking target startup or slowing a recorded call. The runtime does not
+close the inherited descriptor; the operation hooks reuse it in the current
+target image.
 
 The environment variable is configuration metadata, not a secret. When runtime
 loading is enabled, the supervisor removes every caller-provided value and adds

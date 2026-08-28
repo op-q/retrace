@@ -34,6 +34,30 @@ constexpr std::size_t displayed_argument_count = 16U;
   return result;
 }
 
+[[nodiscard]] std::uint64_t decode_u64(const std::string_view bytes) {
+  std::uint64_t result = 0U;
+  for (std::size_t index = 0; index < sizeof(result); ++index) {
+    result |= static_cast<std::uint64_t>(static_cast<unsigned char>(bytes[index]))
+              << (index * 8U);
+  }
+  return result;
+}
+
+// Numeric bases are rendered through a local stream so the caller's formatting
+// state is never modified. A leaked std::hex would silently reformat every
+// later field on the timeline.
+[[nodiscard]] std::string formatted_hexadecimal(const std::uint32_t value) {
+  std::ostringstream result;
+  result << "0x" << std::hex << value;
+  return result.str();
+}
+
+[[nodiscard]] std::string formatted_octal(const std::uint32_t value) {
+  std::ostringstream result;
+  result << '0' << std::oct << value;
+  return result.str();
+}
+
 [[nodiscard]] std::string escaped(const std::string_view bytes,
                                   const std::size_t maximum_bytes) {
   // Escaping is a security boundary: raw trace bytes may contain terminal
@@ -115,8 +139,51 @@ constexpr std::size_t displayed_argument_count = 16U;
       return "signal.receive";
     case trace::EventType::runtime_handshake:
       return "runtime.handshake";
+    case trace::EventType::file_open:
+      return "file.open";
+    case trace::EventType::file_close:
+      return "file.close";
+    case trace::EventType::runtime_operations_dropped:
+      return "runtime.operations_dropped";
   }
   return {};
+}
+
+// Renders one decoded file event. Only the fields meaningful for the operation
+// are printed: a failed open has no descriptor to report, and a close names the
+// descriptor it was given whether or not it succeeded.
+void render_file_event(const trace::EventType type, const trace::FileEvent& file,
+                       std::ostream& output) {
+  const bool failed = file.result < 0;
+  if (type == trace::EventType::file_close) {
+    output << " fd=" << file.descriptor;
+    if (failed) {
+      output << " errno=" << file.error_number;
+    }
+  } else if (failed) {
+    output << " errno=" << file.error_number;
+  } else {
+    output << " fd=" << file.descriptor;
+  }
+
+  if (type == trace::EventType::file_open) {
+    if ((file.flags & trace::file_event_flag_relative_to_directory) != 0U) {
+      output << " dirfd=" << file.directory;
+    }
+    output << " path=" << escaped(file.path, metadata_preview_size);
+    if ((file.flags & trace::file_event_flag_path_truncated) != 0U) {
+      output << " (path truncated)";
+    }
+    output << " open_flags=" << formatted_hexadecimal(file.open_flags);
+    if (file.mode != 0U) {
+      output << " mode=" << formatted_octal(file.mode);
+    }
+  }
+
+  // The leading column is the supervisor's receive time. `completed` is the
+  // target's own completion time, which is what orders concurrent operations.
+  output << " duration=" << formatted_offset(file.duration_nanoseconds)
+         << " completed=" << formatted_offset(file.completion_offset_nanoseconds);
 }
 
 void render_header(const trace::Header& header, std::ostream& output) {
@@ -156,6 +223,9 @@ struct InspectionSummary {
   std::uint64_t duration_nanoseconds = 0U;
   ResultKind result = ResultKind::unknown;
   std::uint32_t result_value = 0U;
+  // Operations the runtime reported that never reached the supervisor. A
+  // nonzero value means the timeline above is incomplete.
+  std::uint64_t dropped_operations = 0U;
 };
 
 void render_event(const trace::Event& event, std::ostream& output,
@@ -195,6 +265,20 @@ void render_event(const trace::Event& event, std::ostream& output,
   } else if (event.type ==
              static_cast<std::uint16_t>(trace::EventType::signal_receive)) {
     output << " signal=" << decode_u32(event.payload);
+  } else if (event.type == static_cast<std::uint16_t>(trace::EventType::file_open) ||
+             event.type == static_cast<std::uint16_t>(trace::EventType::file_close)) {
+    const auto type = static_cast<trace::EventType>(event.type);
+    trace::FileEvent file;
+    // Reader validation already rejected an undecodable payload, so this only
+    // guards the rendering path against ever printing uninitialized fields.
+    if (trace::decode_file_event(type, event.payload, file)) {
+      output << " tid=" << event.thread_id;
+      render_file_event(type, file, output);
+    }
+  } else if (event.type ==
+             static_cast<std::uint16_t>(trace::EventType::runtime_operations_dropped)) {
+    summary.dropped_operations = decode_u64(event.payload);
+    output << " count=" << summary.dropped_operations;
   } else if (name.empty()) {
     output << " tid=" << event.thread_id << " bytes=" << event.payload.size()
            << " preview=" << escaped(event.payload, stream_preview_size);
@@ -220,6 +304,9 @@ void render_summary(const InspectionSummary& summary, const std::string_view sta
     case ResultKind::launch_failed:
       output << "launch-failure(" << summary.result_value << ')';
       break;
+  }
+  if (summary.dropped_operations > 0U) {
+    output << " dropped_operations=" << summary.dropped_operations;
   }
   output << " status=" << status << '\n';
 }

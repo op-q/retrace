@@ -439,6 +439,138 @@ void test_inspect_renders_safe_metadata_and_timeline(TestContext& test) {
               "inspect summarizes all complete events and structural validity");
 }
 
+void test_inspect_renders_file_operations(TestContext& test) {
+  TemporaryPath trace_path;
+  test.expect(!trace_path.value().empty(),
+              "a temporary file-operation trace path is available");
+  if (trace_path.value().empty()) {
+    return;
+  }
+
+  constexpr std::array target_arguments{std::string_view{"demo"}};
+  const retrace::trace::Metadata metadata{
+      .retrace_version = "unit",
+      .operating_system = "TestOS",
+      .architecture = "arch",
+      .working_directory = "/synthetic",
+      .arguments = target_arguments,
+  };
+
+  {
+    retrace::trace::Writer writer;
+    const auto creation =
+        retrace::trace::Writer::create(trace_path.value(), metadata, writer);
+    test.expect(!creation.error, "the file-operation trace is created");
+    if (creation.error) {
+      return;
+    }
+
+    // A path is target-controlled input, so this one carries an escape byte that
+    // must never reach the terminal raw.
+    const retrace::trace::FileEvent opened{
+        .completion_offset_nanoseconds = 1000U,
+        .duration_nanoseconds = 2000U,
+        .result = 3,
+        .error_number = 0U,
+        .descriptor = 3,
+        .directory = 0,
+        .open_flags = 0x241U,
+        .mode = 0600U,
+        .flags = 0U,
+        // Split so the compiler cannot fold the following 'c' into the escape.
+        .path = std::string_view{"/synthetic/es\x1b"
+                                 "cape.txt"},
+    };
+    const retrace::trace::FileEvent missing{
+        .completion_offset_nanoseconds = 3000U,
+        .duration_nanoseconds = 500U,
+        .result = -1,
+        .error_number = 2U,
+        .descriptor = -1,
+        .directory = 0,
+        .open_flags = 0U,
+        .mode = 0U,
+        .flags = retrace::trace::file_event_flag_path_truncated,
+        .path = std::string_view{"/synthetic/long"},
+    };
+    const retrace::trace::FileEvent relative{
+        .completion_offset_nanoseconds = 4000U,
+        .duration_nanoseconds = 600U,
+        .result = 4,
+        .error_number = 0U,
+        .descriptor = 4,
+        .directory = 3,
+        .open_flags = 0U,
+        .mode = 0U,
+        .flags = retrace::trace::file_event_flag_relative_to_directory,
+        .path = std::string_view{"observed.txt"},
+    };
+    const retrace::trace::FileEvent closed{
+        .completion_offset_nanoseconds = 5000U,
+        .duration_nanoseconds = 100U,
+        .result = -1,
+        .error_number = 9U,
+        .descriptor = -1,
+        .directory = 0,
+        .open_flags = 0U,
+        .mode = 0U,
+        .flags = 0U,
+        .path = {},
+    };
+
+    const auto start_error =
+        writer.write_event(retrace::trace::EventType::process_start, 42U);
+    const auto opened_error =
+        writer.write_file_event(retrace::trace::EventType::file_open, 42U, 77U, opened);
+    const auto missing_error = writer.write_file_event(
+        retrace::trace::EventType::file_open, 42U, 77U, missing);
+    const auto relative_error = writer.write_file_event(
+        retrace::trace::EventType::file_open, 42U, 77U, relative);
+    const auto closed_error = writer.write_file_event(
+        retrace::trace::EventType::file_close, 42U, 77U, closed);
+    const auto dropped_error = writer.write_dropped_operations_event(42U, 3U);
+    const auto exit_error =
+        writer.write_value_event(retrace::trace::EventType::process_exit, 42U, 0U);
+    test.expect(!start_error && !opened_error && !missing_error && !relative_error &&
+                    !closed_error && !dropped_error && !exit_error,
+                "the synthetic file-operation events are written");
+  }
+
+  const std::array arguments{std::string_view{"inspect"},
+                             std::string_view{trace_path.value()}};
+  std::ostringstream output;
+  std::ostringstream error;
+  const auto result = retrace::cli::run(arguments, output, error);
+  const auto rendered = output.str();
+
+  test.expect(result == static_cast<int>(retrace::cli::ExitCode::success),
+              "inspect accepts a trace containing file operations");
+  test.expect(rendered.find("file.open") != std::string::npos &&
+                  rendered.find("tid=77 fd=3 path=\"/synthetic/es\\x1bcape.txt\"") !=
+                      std::string::npos,
+              "inspect renders a successful open and escapes its path");
+  test.expect(rendered.find("open_flags=0x241 mode=0600") != std::string::npos,
+              "inspect renders open flags in hexadecimal and the mode in octal");
+  test.expect(
+      rendered.find("tid=77 errno=2 path=\"/synthetic/long\" (path truncated)") !=
+          std::string::npos,
+      "inspect reports a failed open and marks a truncated path");
+  test.expect(rendered.find("fd=4 dirfd=3 path=\"observed.txt\"") != std::string::npos,
+              "inspect names the directory an openat resolved against");
+  test.expect(rendered.find("file.close") != std::string::npos &&
+                  rendered.find("tid=77 fd=-1 errno=9") != std::string::npos,
+              "inspect reports a failed close with the descriptor it was given");
+  test.expect(
+      rendered.find("duration=0.002 ms completed=0.001 ms") != std::string::npos,
+      "inspect distinguishes the call duration from its completion time");
+  test.expect(rendered.find("runtime.operations_dropped") != std::string::npos &&
+                  rendered.find("count=3") != std::string::npos,
+              "inspect renders the dropped-operation event");
+  test.expect(rendered.find("dropped_operations=3 status=structurally-valid\n") !=
+                  std::string::npos,
+              "the summary reports that the recorded timeline is incomplete");
+}
+
 void test_validate_reports_a_normal_output_failure(TestContext& test) {
   TemporaryPath trace_path;
   test.expect(!trace_path.value().empty(),
@@ -1019,6 +1151,7 @@ int main() {
   test_trace_commands_report_a_missing_file(test);
   test_validate_accepts_a_structurally_valid_trace(test);
   test_inspect_renders_safe_metadata_and_timeline(test);
+  test_inspect_renders_file_operations(test);
   test_validate_reports_a_normal_output_failure(test);
   test_inspect_reports_a_normal_output_failure(test);
   test_trace_commands_reject_a_malformed_header(test);

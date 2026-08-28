@@ -87,6 +87,58 @@ Signals:
   return {};
 }
 
+// Translates one observed libc operation into its on-disk event. The live
+// protocol and the trace format are separate contracts, so each field is copied
+// explicitly rather than reinterpreted: only the members meaningful for the
+// operation are stored, and the rest stay zero.
+[[nodiscard]] std::error_code record_operation(trace::Writer& writer,
+                                               const process::ProcessEvent& event) {
+  const auto* const operation = event.operation;
+  if (operation == nullptr) {
+    return std::make_error_code(std::errc::protocol_error);
+  }
+  const auto process_id = static_cast<std::uint32_t>(event.process_id);
+
+  trace::FileEvent fields{
+      .completion_offset_nanoseconds =
+          writer.offset_from_monotonic(operation->monotonic_nanoseconds),
+      .duration_nanoseconds = operation->duration_nanoseconds,
+      .result = operation->result,
+      .error_number = operation->error_number,
+      .descriptor = operation->descriptor,
+      // Explicit defaults for the remaining members prevent GCC's missing-field
+      // warning and keep every operation-specific field visible at this site.
+      .directory = 0,
+      .open_flags = 0U,
+      .mode = 0U,
+      .flags = 0U,
+      .path = {},
+  };
+
+  switch (operation->kind) {
+    case process::RuntimeOperationKind::file_openat:
+      // Only openat resolves against a directory descriptor. Plain open reports
+      // AT_FDCWD, which would be a meaningless value to store as a base.
+      fields.flags |= trace::file_event_flag_relative_to_directory;
+      fields.directory = operation->directory;
+      [[fallthrough]];
+    case process::RuntimeOperationKind::file_open:
+      fields.open_flags = operation->open_flags;
+      fields.mode = operation->mode;
+      fields.path = operation->path;
+      if (operation->path_truncated) {
+        fields.flags |= trace::file_event_flag_path_truncated;
+      }
+      return writer.write_file_event(trace::EventType::file_open, process_id,
+                                     operation->thread_id, fields);
+    case process::RuntimeOperationKind::file_close:
+      return writer.write_file_event(trace::EventType::file_close, process_id,
+                                     operation->thread_id, fields);
+  }
+
+  return std::make_error_code(std::errc::protocol_error);
+}
+
 [[nodiscard]] std::error_code record_event(trace::Writer& writer,
                                            const process::ProcessEvent& event) {
   // Process events are an in-memory contract. This switch is the explicit
@@ -111,13 +163,7 @@ Signals:
     case process::ProcessEventType::runtime_handshake:
       return writer.write_event(trace::EventType::runtime_handshake, process_id);
     case process::ProcessEventType::runtime_operation:
-      // The supervisor decodes and validates observed file operations, but the
-      // v1.0 trace has no event type for them yet: docs/trace-format.md still
-      // lists file events as planned. Recording them requires defining their
-      // on-disk payload, which is a separate format decision from the live
-      // protocol. Until then a recording omits them rather than inventing a
-      // layout that later traces would have to stay compatible with.
-      return {};
+      return record_operation(writer, event);
     case process::ProcessEventType::standard_output:
       return writer.write_event(trace::EventType::standard_output, process_id,
                                 event.bytes);
@@ -339,11 +385,27 @@ struct RunArguments {
        .runtime_library = runtime_library_bytes,
        .runtime_channel_enabled = !run_arguments.no_runtime});
 
+  // The drop count is only final once supervision ends, so it is recorded as a
+  // closing event. A trace that silently omitted operations would otherwise look
+  // exactly like a complete one.
+  if (trace_writer.is_open() && !trace_error &&
+      result.dropped_runtime_operations > 0U && result.process_id > 0) {
+    trace_error = trace_writer.write_dropped_operations_event(
+        static_cast<std::uint32_t>(result.process_id),
+        result.dropped_runtime_operations);
+  }
+
   if (trace_writer.is_open()) {
     const auto finish_error = trace_writer.finish();
     if (!trace_error) {
       trace_error = finish_error;
     }
+  }
+
+  if (result.dropped_runtime_operations > 0U) {
+    error << "warning: the runtime channel dropped "
+          << result.dropped_runtime_operations << " reported operations\n"
+          << "cause: the bounded event channel could not keep up with the target\n";
   }
 
   if (trace_error) {

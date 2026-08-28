@@ -38,6 +38,12 @@ add_executable(retrace_signal_fixture fixtures/signal_fixture.c)
 retrace_set_project_warnings(retrace_signal_fixture)
 add_dependencies(retrace_cli_test retrace_signal_fixture)
 
+# The file fixture exercises the interposed libc calls from a real target,
+# including from several threads at once.
+add_executable(retrace_file_fixture fixtures/file_fixture.c)
+target_link_libraries(retrace_file_fixture PRIVATE Threads::Threads)
+retrace_set_project_warnings(retrace_file_fixture)
+
 add_library(retrace_preload_fixture SHARED fixtures/preload_fixture.c)
 retrace_set_project_warnings(retrace_preload_fixture)
 
@@ -81,6 +87,7 @@ target_link_libraries(retrace_process_test PRIVATE retrace::core)
 target_compile_definitions(
   retrace_process_test
   PRIVATE
+    RETRACE_FILE_FIXTURE_PATH="$<TARGET_FILE:retrace_file_fixture>"
     RETRACE_PRELOAD_FIXTURE_PATH="$<TARGET_FILE:retrace_preload_fixture>"
     RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH="$<TARGET_FILE:retrace_runtime_channel_fixture>"
     RETRACE_RUNTIME_LIBRARY_PATH="$<TARGET_FILE:retrace_runtime>"
@@ -89,6 +96,7 @@ target_compile_definitions(
 )
 add_dependencies(
   retrace_process_test
+  retrace_file_fixture
   retrace_preload_fixture
   retrace_runtime
   retrace_runtime_channel_fixture

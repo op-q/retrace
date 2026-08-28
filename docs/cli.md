@@ -109,10 +109,21 @@ raw-output mode.
 
 Trace metadata and payloads are bytes, not trusted terminal text. The renderer
 quotes them and escapes NUL, newline, carriage return, tab, quotes, backslashes,
-and other non-printable bytes. Metadata previews are limited to 160 input bytes,
-stream and unknown-event previews to 64 input bytes, and the command line to the
-first 16 arguments. A valid event identifier not known to this build is shown as
-`unknown(ID)` with its thread ID, byte count, and escaped preview.
+and other non-printable bytes. Metadata and recorded-path previews are limited to
+160 input bytes, stream and unknown-event previews to 64 input bytes, and the
+command line to the first 16 arguments. A valid event identifier not known to
+this build is shown as `unknown(ID)` with its thread ID, byte count, and escaped
+preview.
+
+File events name the target thread that made the call. A successful call shows
+`fd=`; a failed one shows `errno=`, except for a close, which always names the
+descriptor it was given. `open_flags` is hexadecimal, `mode` is octal and appears
+only when the open flags can create a file, and `dirfd=` appears only for an
+`openat`. A path the runtime had to truncate is marked `(path truncated)`, which
+is distinct from the renderer's own preview limit shown as a trailing `...`.
+Every file event ends with the call's `duration` and the `completed` time
+observed inside the target, which is what orders concurrent operations; the
+leading column is the supervisor's receive time.
 
 Representative output:
 
@@ -126,10 +137,19 @@ CREATED_UNIX_NS 1784541600000000000
 EVENTS
        0.012 ms  process.start           pid=4210
        0.038 ms  process.exec            pid=4210
+       0.101 ms  runtime.handshake       pid=4210
+       0.126 ms  file.open               pid=4210 tid=4210 fd=3 path="/tmp/data.txt" open_flags=0x0 duration=0.014 ms completed=0.119 ms
+       0.140 ms  file.close              pid=4210 tid=4210 fd=3 duration=0.002 ms completed=0.133 ms
        0.174 ms  stdout.chunk            pid=4210 bytes=6 preview="hello\n"
        0.281 ms  process.exit            pid=4210 code=0
-SUMMARY events=4 duration=0.281 ms result=exit(0) status=structurally-valid
+SUMMARY events=7 duration=0.281 ms result=exit(0) status=structurally-valid
 ```
+
+When the bounded runtime channel dropped reported operations, the trace ends with
+a `runtime.operations_dropped` event and the summary gains
+`dropped_operations=N` before its status. `run` also writes a warning to stderr
+in that case, because a recording that silently omitted operations would
+otherwise look exactly like a complete one.
 
 If only the final event frame is incomplete, `inspect` still prints the header,
 every preceding complete event, and a summary with `status=incomplete`. It also

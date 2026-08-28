@@ -29,12 +29,17 @@ RETRACE is pre-alpha but has a working process-recording and inspection slice:
   event stream into memory; and
 - each ordinary run locates and loads `libretrace_runtime.so` with `LD_PRELOAD`,
   preserves caller preload entries, validates its bounded Unix-domain channel,
-  and records `runtime.handshake`; `--no-runtime` disables this path; and
+  and records `runtime.handshake`; `--no-runtime` disables this path;
+- the loaded runtime interposes `open`, `open64`, `openat`, `openat64`, and
+  `close`, and each observed call becomes a `file.open` or `file.close` trace
+  event carrying its path, descriptor, result, `errno`, and duration;
+- operations the bounded runtime channel dropped are counted and reported, so an
+  incomplete recording is never presented as a complete one; and
 - dependency-free tests exercise the CLI, process and trace layers, plus C
-  stream and runtime fixtures.
+  stream, file, and runtime fixtures.
 
-Libc-operation instrumentation, time limits, trace export, and fault injection
-are not implemented yet. Static, setuid, or otherwise loader-restricted targets
+Socket and read/write instrumentation, time limits, trace export, and fault
+injection are not implemented yet. Static, setuid, or otherwise loader-restricted targets
 cannot be instrumented; RETRACE reports a missing required handshake after
 preserving their observed lifecycle evidence. A successful validation means
 that the bytes are structurally valid v1.0; because v1.0 has no footer or
@@ -63,12 +68,22 @@ Recorded traces can be inspected or structurally validated:
 ```
 
 The v0.1 process-recorder slice is implemented. The v0.2 work now includes a
-standalone C17 library, versioned handshake, and a supervisor-owned channel that
-automatically loads the runtime into supported dynamic targets, validates the
-handshake, and records it. Operation interposition remains the next v0.2 slice.
+standalone C17 library, versioned handshake, a supervisor-owned channel that
+automatically loads the runtime into supported dynamic targets, and recorded file
+operations observed inside the target:
 
-Later v0.2 work will use the loaded runtime to observe selected libc operations;
-v0.3 will control them with bounded fault rules:
+```bash
+./build/dev/bin/retrace run --output /tmp/files.rtc -- /bin/cat /etc/hostname
+./build/dev/bin/retrace inspect /tmp/files.rtc
+```
+
+```text
+       0.594 ms  file.open    pid=68278 tid=68278 fd=3 path="/etc/hostname" ...
+       0.598 ms  file.close   pid=68278 tid=68278 fd=3 ...
+```
+
+Socket and read/write operations are the remaining v0.2 slice; v0.3 will control
+them with bounded fault rules:
 
 ```bash
 # Planned for v0.3; not implemented yet.
@@ -120,8 +135,8 @@ No third-party runtime or test dependencies are used at this stage.
 
 ## Safety warning
 
-Trace data may contain command arguments, paths, standard output, and standard
-error. Any of those can contain secrets. Recording currently requires an
+Trace data may contain command arguments, working directories, the paths of
+files the target opened, standard output, and standard error. Any of those can contain secrets. Recording currently requires an
 explicit `--output` path; review every trace before sharing it. See
 [docs/security.md](docs/security.md) for the full safety model.
 

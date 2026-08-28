@@ -87,7 +87,8 @@ Initial progress:
 - [x] Keep absent, invalid, and closed event channels nonfatal.
 - [x] Create and validate the runtime channel in the supervisor.
 - [x] Load the runtime into supported dynamic targets.
-- [ ] Interpose and record the selected libc operations.
+- [x] Interpose `open`, `openat`, and `close`, and record them in the trace.
+- [ ] Interpose `connect` and selected read/write metadata.
 
 ## v0.3 — fault injection
 

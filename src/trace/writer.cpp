@@ -29,6 +29,19 @@ constexpr std::size_t trace_header_prefix_size = 16U;
 constexpr std::size_t event_header_size = 28U;
 constexpr std::uint32_t event_header_after_length_size = 24U;
 
+// File-event payload offsets. Named offsets keep this encoder independent from
+// struct padding and alignment, exactly as the reader's decoder is.
+constexpr std::size_t file_event_completion_offset = 0U;
+constexpr std::size_t file_event_duration_offset = 8U;
+constexpr std::size_t file_event_result_offset = 16U;
+constexpr std::size_t file_event_errno_offset = 24U;
+constexpr std::size_t file_event_descriptor_offset = 28U;
+constexpr std::size_t file_event_directory_offset = 32U;
+constexpr std::size_t file_event_open_flags_offset = 36U;
+constexpr std::size_t file_event_mode_offset = 40U;
+constexpr std::size_t file_event_flags_offset = 44U;
+constexpr std::size_t file_event_path_size_offset = 48U;
+
 [[nodiscard]] std::error_code system_error(const int error_number) {
   return {error_number, std::generic_category()};
 }
@@ -250,8 +263,9 @@ CreationResult Writer::create(const std::filesystem::path& path,
   return {.error = {}, .file_created = true};
 }
 
-std::error_code Writer::write_event(const EventType type,
+std::error_code Writer::write_frame(const EventType type,
                                     const std::uint32_t process_id,
+                                    const std::uint32_t thread_id,
                                     const std::string_view payload) {
   // Event schemas are checked here as well as by the reader. A writer bug should
   // not be able to create bytes that its matching reader rejects.
@@ -281,6 +295,21 @@ std::error_code Writer::write_event(const EventType type,
         return std::make_error_code(std::errc::invalid_argument);
       }
       break;
+    case EventType::file_open:
+    case EventType::file_close: {
+      // Validating by decoding is deliberate: it uses the reader's own rules
+      // instead of a second copy of them that could drift out of agreement.
+      FileEvent decoded;
+      if (!decode_file_event(type, payload, decoded)) {
+        return std::make_error_code(std::errc::invalid_argument);
+      }
+      break;
+    }
+    case EventType::runtime_operations_dropped:
+      if (payload.size() != sizeof(std::uint64_t)) {
+        return std::make_error_code(std::errc::invalid_argument);
+      }
+      break;
   }
 
   std::uint64_t now_nanoseconds = 0U;
@@ -298,7 +327,7 @@ std::error_code Writer::write_event(const EventType type,
   encode_u16(header.data() + 6U, 0U);
   encode_u64(header.data() + 8U, offset_nanoseconds);
   encode_u32(header.data() + 16U, process_id);
-  encode_u32(header.data() + 20U, 0U);
+  encode_u32(header.data() + 20U, thread_id);
   encode_u32(header.data() + 24U, payload_size);
 
   if (const auto error = write_all(descriptor_, header.data(), header.size())) {
@@ -312,6 +341,14 @@ std::error_code Writer::write_event(const EventType type,
     }
   }
   return {};
+}
+
+std::error_code Writer::write_event(const EventType type,
+                                    const std::uint32_t process_id,
+                                    const std::string_view payload) {
+  // Supervisor-observed events belong to no particular target thread, so their
+  // frames carry the zero thread identifier v1.0 defines for that case.
+  return write_frame(type, process_id, 0U, payload);
 }
 
 // The two u32 values occupy distinct fields selected by the strongly typed event.
@@ -329,6 +366,73 @@ std::error_code Writer::write_value_event(const EventType type,
                      {reinterpret_cast<const char*>(payload.data()), payload.size()});
 }
 // NOLINTEND(bugprone-easily-swappable-parameters)
+
+std::error_code Writer::write_file_event(const EventType type,
+                                         const std::uint32_t process_id,
+                                         const std::uint32_t thread_id,
+                                         const FileEvent& fields) {
+  if (type != EventType::file_open && type != EventType::file_close) {
+    return std::make_error_code(std::errc::invalid_argument);
+  }
+  // The runtime already bounds every path it reports, so a longer one is a
+  // supervisor bug rather than target behavior and is refused instead of
+  // silently truncated into evidence that looks complete.
+  if (fields.path.size() > maximum_file_event_path_size) {
+    return std::make_error_code(std::errc::message_size);
+  }
+
+  // Value-initializing this buffer would re-zero four kilobytes for every
+  // recorded call, which becomes measurable at target speed. Static
+  // thread-local storage is zeroed once per thread, and only the bytes this
+  // call encodes are ever written out.
+  static thread_local std::array<std::byte,
+                                 file_event_header_size + maximum_file_event_path_size>
+      buffer;
+  const auto path_size = static_cast<std::uint32_t>(fields.path.size());
+
+  encode_u64(buffer.data() + file_event_completion_offset,
+             fields.completion_offset_nanoseconds);
+  encode_u64(buffer.data() + file_event_duration_offset, fields.duration_nanoseconds);
+  // A negative result is stored as its two's complement bit pattern, which C++20
+  // fixes for signed integers, so the reader can convert it back exactly.
+  encode_u64(buffer.data() + file_event_result_offset,
+             static_cast<std::uint64_t>(fields.result));
+  encode_u32(buffer.data() + file_event_errno_offset, fields.error_number);
+  encode_u32(buffer.data() + file_event_descriptor_offset,
+             static_cast<std::uint32_t>(fields.descriptor));
+  encode_u32(buffer.data() + file_event_directory_offset,
+             static_cast<std::uint32_t>(fields.directory));
+  encode_u32(buffer.data() + file_event_open_flags_offset, fields.open_flags);
+  encode_u32(buffer.data() + file_event_mode_offset, fields.mode);
+  encode_u32(buffer.data() + file_event_flags_offset, fields.flags);
+  encode_u32(buffer.data() + file_event_path_size_offset, path_size);
+  if (path_size > 0U) {
+    std::copy(fields.path.begin(), fields.path.end(),
+              reinterpret_cast<char*>(buffer.data() + file_event_header_size));
+  }
+
+  return write_frame(type, process_id, thread_id,
+                     {reinterpret_cast<const char*>(buffer.data()),
+                      file_event_header_size + path_size});
+}
+
+// The two values occupy distinct fields of different widths, selected by name at
+// the single call site.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+std::error_code Writer::write_dropped_operations_event(const std::uint32_t process_id,
+                                                       const std::uint64_t count) {
+  std::array<std::byte, sizeof(count)> payload{};
+  encode_u64(payload.data(), count);
+  return write_event(EventType::runtime_operations_dropped, process_id,
+                     {reinterpret_cast<const char*>(payload.data()), payload.size()});
+}
+
+std::uint64_t Writer::offset_from_monotonic(
+    const std::uint64_t monotonic_nanoseconds) const noexcept {
+  return monotonic_nanoseconds >= monotonic_base_nanoseconds_
+             ? monotonic_nanoseconds - monotonic_base_nanoseconds_
+             : 0U;
+}
 
 std::error_code Writer::finish() noexcept {
   if (descriptor_ < 0) {
