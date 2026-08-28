@@ -78,12 +78,20 @@ static int load_runtime(void) {
 }
 
 int main(const int argument_count, char* const arguments[]) {
+  if (argument_count == 3 && strcmp(arguments[1], "expect-preload") == 0) {
+    const char* const preload = getenv("LD_PRELOAD");
+    return preload != NULL && strcmp(preload, arguments[2]) == 0 ? EXIT_SUCCESS
+                                                                 : EXIT_FAILURE;
+  }
   if (argument_count != 2) {
     return EXIT_FAILURE;
   }
 
   if (strcmp(arguments[1], "load-runtime") == 0) {
     return load_runtime();
+  }
+  if (strcmp(arguments[1], "no-channel") == 0) {
+    return getenv(RETRACE_RUNTIME_EVENT_FD_ENV) == NULL ? EXIT_SUCCESS : EXIT_FAILURE;
   }
 
   const int descriptor = runtime_descriptor();

@@ -37,23 +37,53 @@ namespace {
   return {error_number, std::generic_category()};
 }
 
+[[nodiscard]] bool is_preload_separator(const char byte) {
+  return byte == ':' || byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r' ||
+         byte == '\f' || byte == '\v';
+}
+
 void build_target_environment(const int runtime_descriptor,
+                              const std::string_view runtime_library,
                               std::vector<std::string>& owned_environment,
                               std::vector<char*>& environment_pointers) {
   // Build all strings before the char* array so vector growth cannot invalidate
-  // pointers. Every caller-provided channel value is removed, then one trusted
-  // descriptor entry is appended.
+  // pointers. RETRACE replaces its channel value and, when injecting, prepends
+  // its library while retaining every caller-provided preload token.
   const std::string runtime_prefix = std::string{RETRACE_RUNTIME_EVENT_FD_ENV} + '=';
+  constexpr std::string_view preload_prefix = "LD_PRELOAD=";
+  std::string inherited_preloads;
 
   if (environ != nullptr) {
     for (auto cursor = environ; *cursor != nullptr; ++cursor) {
       const std::string_view entry{*cursor};
-      if (!entry.starts_with(runtime_prefix)) {
-        owned_environment.emplace_back(entry);
+      if (entry.starts_with(runtime_prefix)) {
+        continue;
       }
+      if (!runtime_library.empty() && entry.starts_with(preload_prefix)) {
+        const auto value = entry.substr(preload_prefix.size());
+        if (!value.empty()) {
+          if (!inherited_preloads.empty()) {
+            inherited_preloads.push_back(':');
+          }
+          inherited_preloads.append(value);
+        }
+        continue;
+      }
+      owned_environment.emplace_back(entry);
     }
   }
-  owned_environment.push_back(runtime_prefix + std::to_string(runtime_descriptor));
+  if (runtime_descriptor >= 0) {
+    owned_environment.push_back(runtime_prefix + std::to_string(runtime_descriptor));
+  }
+  if (!runtime_library.empty()) {
+    std::string preload{preload_prefix};
+    preload.append(runtime_library);
+    if (!inherited_preloads.empty()) {
+      preload.push_back(':');
+      preload.append(inherited_preloads);
+    }
+    owned_environment.push_back(std::move(preload));
+  }
 
   environment_pointers.reserve(owned_environment.size() + 1U);
   for (auto& entry : owned_environment) {
@@ -111,6 +141,83 @@ class ForwardedSignals final {
   sigset_t previous_mask_{};
   UniqueFd descriptor_;
   bool mask_changed_ = false;
+};
+
+// tcsetpgrp(3) called from a background process group raises SIGTTOU at the
+// caller, which is the very stop this helper exists to avoid. Blocking the
+// signal across the call is the standard job-control guard. Only async-signal-
+// safe calls are used so the forked child can reuse it before exec.
+[[nodiscard]] bool set_foreground_group(const int terminal,
+                                        const pid_t group) noexcept {
+  sigset_t blocked{};
+  sigset_t previous{};
+  if (::sigemptyset(&blocked) < 0 || ::sigaddset(&blocked, SIGTTOU) < 0) {
+    return false;
+  }
+  if (::sigprocmask(SIG_BLOCK, &blocked, &previous) < 0) {
+    return false;
+  }
+
+  const bool changed = ::tcsetpgrp(terminal, group) == 0;
+  [[maybe_unused]] const auto restored = ::sigprocmask(SIG_SETMASK, &previous, nullptr);
+  return changed;
+}
+
+// A target leading its own process group is in the background, so the kernel
+// stops it with SIGTTIN or SIGTTOU as soon as it touches the controlling
+// terminal. RETRACE lends the terminal to the target's group for the run and
+// takes it back afterwards. Having no controlling terminal, or being in the
+// background itself, are ordinary conditions: the run proceeds without job
+// control rather than failing.
+class TerminalForeground final {
+ public:
+  TerminalForeground() = default;
+  ~TerminalForeground() { restore(); }
+
+  TerminalForeground(const TerminalForeground&) = delete;
+  TerminalForeground& operator=(const TerminalForeground&) = delete;
+
+  void open_controlling_terminal() noexcept {
+    // /dev/tty resolves the controlling terminal whatever the standard
+    // descriptors were redirected to.
+    const int descriptor = ::open("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+    if (descriptor < 0) {
+      return;
+    }
+
+    terminal_.reset(descriptor);
+    original_group_ = ::tcgetpgrp(terminal_.get());
+    if (original_group_ < 0 || original_group_ != ::getpgrp()) {
+      // Stealing the terminal from an unrelated foreground job would stop that
+      // job instead, so leave job control alone.
+      original_group_ = -1;
+      terminal_.reset();
+    }
+  }
+
+  [[nodiscard]] bool available() const noexcept { return terminal_.get() >= 0; }
+  [[nodiscard]] int descriptor() const noexcept { return terminal_.get(); }
+
+  void grant(const pid_t group) noexcept {
+    if (!available() || group <= 0) {
+      return;
+    }
+    granted_ = set_foreground_group(terminal_.get(), group);
+  }
+
+  void restore() noexcept {
+    if (!granted_) {
+      return;
+    }
+    granted_ = false;
+    [[maybe_unused]] const bool returned =
+        set_foreground_group(terminal_.get(), original_group_);
+  }
+
+ private:
+  UniqueFd terminal_;
+  pid_t original_group_ = -1;
+  bool granted_ = false;
 };
 
 void send_launch_error(const int descriptor, const int error_number) noexcept {
@@ -204,12 +311,39 @@ struct MonitoredStream {
   ProcessEventType event_type = ProcessEventType::standard_output;
 };
 
+// Runtime-channel state that must persist across drains. Sequence accounting
+// tolerates reordering: each target thread takes a sequence number before its
+// own send(2), so two threads can deliver 6 before 5 without either being lost.
+// Comparing the highest number seen against the number actually received
+// therefore measures loss correctly, while a running "expected next" counter
+// would misreport ordinary concurrency as dropped events.
+struct RuntimeReceiveState {
+  bool handshake_received = false;
+  bool any_operation_seen = false;
+  std::uint64_t highest_sequence = 0U;
+  std::uint64_t received_operations = 0U;
+  RuntimeOperation operation;
+
+  [[nodiscard]] std::uint64_t dropped_operations() const noexcept {
+    if (!any_operation_seen) {
+      return 0U;
+    }
+    // The target supplies these numbers and may repeat them, which would make
+    // more packets arrive than the highest sequence accounts for. Reporting an
+    // underflowed count as an enormous loss would be worse than reporting none,
+    // so the subtraction is guarded.
+    const std::uint64_t expected = highest_sequence + 1U;
+    return expected > received_operations ? expected - received_operations : 0U;
+  }
+};
+
 struct CaptureResult {
   int wait_status = 0;
   std::error_code output_error;
   std::error_code runtime_error;
   std::error_code signal_error;
   std::error_code wait_error;
+  RuntimeReceiveState runtime;
 };
 
 // A handler failure stops future callback delivery but never abandons the
@@ -235,6 +369,26 @@ class EventDispatcher final {
     }
   }
 
+  // Operations are delivered by borrowed pointer because the supervisor reuses
+  // one instance for every packet it decodes.
+  void send_operation(const RuntimeOperation& operation) {
+    if (!handler_ || error_) {
+      return;
+    }
+
+    try {
+      error_ = handler_({.type = ProcessEventType::runtime_operation,
+                         .process_id = process_id_,
+                         .value = 0,
+                         .bytes = {},
+                         .operation = &operation});
+    } catch (const std::system_error& error) {
+      error_ = error.code();
+    } catch (...) {
+      error_ = std::make_error_code(std::errc::io_error);
+    }
+  }
+
   [[nodiscard]] const std::error_code& error() const noexcept { return error_; }
 
  private:
@@ -245,18 +399,32 @@ class EventDispatcher final {
 
 [[nodiscard]] std::error_code receive_runtime_messages(RuntimeChannel& runtime_channel,
                                                        EventDispatcher& events,
-                                                       bool& handshake_received) {
+                                                       RuntimeReceiveState& state) {
   // Drain only what is immediately queued. A second handshake is invalid in the
   // current session-level protocol and closes the instrumentation channel.
   while (runtime_channel.supervisor_descriptor() >= 0) {
-    const auto received = runtime_channel.receive();
+    const auto received = runtime_channel.receive(state.operation);
     switch (received.status) {
       case RuntimeReceiveStatus::handshake:
-        if (handshake_received) {
+        if (state.handshake_received) {
           return std::make_error_code(std::errc::protocol_error);
         }
-        handshake_received = true;
+        state.handshake_received = true;
         events.send(ProcessEventType::runtime_handshake);
+        break;
+      case RuntimeReceiveStatus::operation:
+        // An operation before the handshake would mean the runtime reported
+        // work it never announced itself for, so the channel is not trusted.
+        if (!state.handshake_received) {
+          return std::make_error_code(std::errc::protocol_error);
+        }
+        state.received_operations += 1U;
+        if (!state.any_operation_seen ||
+            state.operation.sequence > state.highest_sequence) {
+          state.highest_sequence = state.operation.sequence;
+        }
+        state.any_operation_seen = true;
+        events.send_operation(state.operation);
         break;
       case RuntimeReceiveStatus::would_block:
         return {};
@@ -307,6 +475,16 @@ struct ChildPollResult {
     } while (kill_result < 0 && errno == EINTR);
 
     if (kill_result == 0) {
+      // A stopped target never acts on a terminating signal; it stays pending
+      // until something resumes the process. SIGCONT after the signal lets the
+      // delivery the target already has take effect. Failure here is not worth
+      // reporting: the terminating signal is queued either way.
+      int continue_result = -1;
+      do {
+        continue_result = ::kill(-process_group, SIGCONT);
+      } while (continue_result < 0 && errno == EINTR);
+      static_cast<void>(continue_result);
+
       events.send(ProcessEventType::signal_forwarded, signal_number);
     } else if (errno != ESRCH) {
       return system_error(errno);
@@ -350,7 +528,6 @@ struct ChildPollResult {
   CaptureResult result;
   std::size_t first_stream = 0U;
   bool child_reaped = false;
-  bool runtime_handshake_received = false;
 
   while (!child_reaped) {
     if (const auto error = forward_pending_signals(signal_descriptor, events, child)) {
@@ -407,8 +584,8 @@ struct ChildPollResult {
         result.runtime_error = std::make_error_code(std::errc::bad_file_descriptor);
         runtime_channel.close_supervisor_end();
       } else if ((runtime_events & (POLLIN | POLLHUP)) != 0) {
-        if (const auto error = receive_runtime_messages(runtime_channel, events,
-                                                        runtime_handshake_received)) {
+        if (const auto error =
+                receive_runtime_messages(runtime_channel, events, result.runtime)) {
           result.runtime_error = error;
           runtime_channel.close_supervisor_end();
         }
@@ -526,8 +703,8 @@ struct ChildPollResult {
     }
 
     if (runtime_channel.supervisor_descriptor() >= 0) {
-      if (const auto error = receive_runtime_messages(runtime_channel, events,
-                                                      runtime_handshake_received)) {
+      if (const auto error =
+              receive_runtime_messages(runtime_channel, events, result.runtime)) {
         result.runtime_error = error;
       }
       runtime_channel.close_supervisor_end();
@@ -557,7 +734,13 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
                   [](const auto argument) {
                     return argument.find('\0') != std::string_view::npos;
                   }) ||
-      options.working_directory.find('\0') != std::string_view::npos) {
+      options.working_directory.find('\0') != std::string_view::npos ||
+      options.runtime_library.find('\0') != std::string_view::npos ||
+      (!options.runtime_library.empty() &&
+       (options.runtime_library.front() != '/' ||
+        std::any_of(options.runtime_library.begin(), options.runtime_library.end(),
+                    is_preload_separator))) ||
+      (!options.runtime_channel_enabled && !options.runtime_library.empty())) {
     return {.state = ProcessState::supervisor_failed,
             .error = std::make_error_code(std::errc::invalid_argument)};
   }
@@ -590,19 +773,26 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     return {.state = ProcessState::supervisor_failed, .error = error};
   }
   RuntimeChannel runtime_channel;
-  if (const auto error = RuntimeChannel::create(runtime_channel)) {
-    return {.state = ProcessState::supervisor_failed, .error = error};
+  if (options.runtime_channel_enabled) {
+    if (const auto error = RuntimeChannel::create(runtime_channel)) {
+      return {.state = ProcessState::supervisor_failed, .error = error};
+    }
   }
 
   std::vector<std::string> owned_environment;
   std::vector<char*> environment_pointers;
-  build_target_environment(runtime_channel.target_descriptor(), owned_environment,
-                           environment_pointers);
+  build_target_environment(runtime_channel.target_descriptor(), options.runtime_library,
+                           owned_environment, environment_pointers);
 
   ForwardedSignals forwarded_signals;
   if (const auto error = forwarded_signals.start()) {
     return {.state = ProcessState::supervisor_failed, .error = error};
   }
+
+  // Opened before fork so both sides share one descriptor for the terminal
+  // handover. Its destructor returns the terminal on every exit path.
+  TerminalForeground terminal;
+  terminal.open_controlling_terminal();
 
   const pid_t child = ::fork();
   if (child < 0) {
@@ -618,6 +808,13 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     if (::setpgid(0, 0) < 0) {
       send_launch_error(launch_errors.write_descriptor(), errno);
       ::_exit(127);
+    }
+    // Both sides claim the terminal because either ordering would otherwise
+    // leave a window where the target is in the background and a terminal read
+    // would stop it. Whichever call lands second is harmless.
+    if (terminal.available()) {
+      [[maybe_unused]] const bool claimed =
+          set_foreground_group(terminal.descriptor(), ::getpid());
     }
     if (const auto error = forwarded_signals.restore_mask()) {
       send_launch_error(launch_errors.write_descriptor(), error.value());
@@ -644,10 +841,12 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
 
     standard_output.close_write_end();
     standard_error.close_write_end();
-    if (const int error = runtime_channel.make_target_descriptor_inheritable();
-        error != 0) {
-      send_launch_error(launch_errors.write_descriptor(), error);
-      ::_exit(127);
+    if (runtime_channel.target_descriptor() >= 0) {
+      if (const int error = runtime_channel.make_target_descriptor_inheritable();
+          error != 0) {
+        send_launch_error(launch_errors.write_descriptor(), error);
+        ::_exit(127);
+      }
     }
     ::execvpe(argument_pointers.front(), argument_pointers.data(),
               environment_pointers.data());
@@ -656,6 +855,16 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
     send_launch_error(launch_errors.write_descriptor(), launch_error);
     ::_exit(127);
   }
+
+  // Mirrors the child's own setpgid so the terminal is never handed to a group
+  // that does not exist yet. EACCES means the child already exec'd and ESRCH
+  // that it is gone; both leave the group correct or irrelevant.
+  if (::setpgid(child, child) < 0 && errno != EACCES && errno != ESRCH) {
+    return {.state = ProcessState::supervisor_failed,
+            .process_id = static_cast<int>(child),
+            .error = system_error(errno)};
+  }
+  terminal.grant(child);
 
   launch_errors.close_write_end();
   standard_output.close_write_end();
@@ -679,6 +888,7 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
       capture_output_and_wait(child, standard_output, standard_error, runtime_channel,
                               forwarded_signals.descriptor(), events);
 
+  terminal.restore();
   const auto signal_restore_error = forwarded_signals.restore_mask();
 
   if (capture.wait_error) {
@@ -741,9 +951,16 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
               .process_id = static_cast<int>(child),
               .error = events.error()};
     }
+    if (!options.runtime_library.empty() && !capture.runtime.handshake_received) {
+      return {.state = ProcessState::runtime_unavailable,
+              .exit_code = exit_code,
+              .process_id = static_cast<int>(child),
+              .error = std::make_error_code(std::errc::not_supported)};
+    }
     return {.state = ProcessState::exited,
             .exit_code = exit_code,
             .process_id = static_cast<int>(child),
+            .dropped_runtime_operations = capture.runtime.dropped_operations(),
             .error = {}};
   }
   if (WIFSIGNALED(capture.wait_status)) {
@@ -759,9 +976,16 @@ ProcessResult execute(const std::span<const std::string_view> arguments,
               .process_id = static_cast<int>(child),
               .error = events.error()};
     }
+    if (!options.runtime_library.empty() && !capture.runtime.handshake_received) {
+      return {.state = ProcessState::runtime_unavailable,
+              .signal_number = signal_number,
+              .process_id = static_cast<int>(child),
+              .error = std::make_error_code(std::errc::not_supported)};
+    }
     return {.state = ProcessState::signaled,
             .signal_number = signal_number,
             .process_id = static_cast<int>(child),
+            .dropped_runtime_operations = capture.runtime.dropped_operations(),
             .error = {}};
   }
 

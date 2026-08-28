@@ -16,7 +16,7 @@ RETRACE should:
 
 - launch and supervise Linux processes without requiring root;
 - record process start/exit, signals, duration, stdout, and stderr;
-- later observe selected file and socket operations through an injected runtime;
+- observe selected file and socket operations through an injected runtime;
 - persist a versioned, crash-tolerant, streaming trace;
 - render a readable terminal timeline and export reviewable data;
 - inject a deliberately small set of deterministic, bounded faults;

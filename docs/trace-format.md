@@ -77,7 +77,7 @@ Each event has a fixed 28-byte prefix followed by its bounded payload:
 | 6 | 2 | flags, currently zero |
 | 8 | 8 | nanoseconds since the header's monotonic base |
 | 16 | 4 | process identifier |
-| 20 | 4 | thread identifier, currently zero |
+| 20 | 4 | thread identifier, zero for supervisor-observed events |
 | 24 | 4 | payload size |
 | 28 | variable | payload bytes |
 
@@ -118,6 +118,9 @@ endianness can differ.
 | 7 | `process.launch_failure` | `u32` saved `errno` |
 | 8 | `signal.receive` | `u32` signal number |
 | 9 | `runtime.handshake` | empty |
+| 10 | `file.open` | file-event payload |
+| 11 | `file.close` | file-event payload |
+| 12 | `runtime.operations_dropped` | `u64` lost operation count |
 
 `process.start` records the child created by `fork()`. `process.exec` is emitted
 when the close-on-exec launch-status pipe reaches EOF without reporting an
@@ -137,21 +140,77 @@ successfully forwarded to the target process group. It is distinct from
 `process.signal`, which records that the direct target was ultimately terminated
 by a signal. A target may handle a forwarded signal and exit normally.
 
-`runtime.handshake` records that the supervisor received and validated one
-version-compatible handshake packet from the target's runtime channel. It proves
-that a sender reached the handshake protocol; it does not prove that later
-interposition hooks are installed or that every operation is visible.
+`runtime.handshake` records that the supervisor received and validated the one
+version-compatible packet required after automatically loading the direct
+target's runtime. It proves that the constructor reached the handshake protocol;
+it does not prove that later interposition hooks are installed or that every
+operation is visible. Runs using `--no-runtime` contain no handshake.
+
+Event identifiers 10 to 12 were added after the first nine. Adding an identifier
+is backward compatible by design: a reader that predates one keeps its frame as a
+valid unknown event rather than rejecting the file, which is why the format
+version stays 1.0.
+
+## File events
+
+`file.open` and `file.close` record one interposed libc call each, translated
+from the [runtime event protocol](runtime-protocol.md). `file.open` covers both
+`open` and `openat`; the two differ only by a payload flag and the directory
+descriptor an `openat` resolved against. The frame's thread identifier is the
+target thread that made the call, which is how concurrent operations stay
+attributable.
+
+Both events share one payload layout, so a consumer never has to know which
+field a given operation used. Unused fields are zero:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 8 | completion time, in nanoseconds after the header's monotonic base |
+| 8 | 8 | call duration in nanoseconds |
+| 16 | 8 | `i64` return value of the interposed call |
+| 24 | 4 | saved `errno`, meaningful only when the return value is negative |
+| 28 | 4 | `i32` descriptor: a successful open result, or a close argument |
+| 32 | 4 | `i32` directory descriptor, with the relative-to-directory flag |
+| 36 | 4 | open flags |
+| 40 | 4 | creation mode, zero unless the open flags can create a file |
+| 44 | 4 | payload flags |
+| 48 | 4 | path size |
+| 52 | variable | path bytes, without a terminator |
+
+Payload flags are unrelated to the frame header's flags field, which stays zero:
+
+| Bit | Name | Meaning |
+| ---: | --- | --- |
+| `0x1` | path truncated | the stored path is a bounded prefix of the argument |
+| `0x2` | relative to directory | the call was `openat`; the directory field applies |
+
+A path is stored as at most 4096 bytes, matching the Linux `PATH_MAX` without
+the NUL that is not stored. A target may legally pass a longer path and receive
+`ENAMETOOLONG`; the attempt is still recorded, with the truncation flag set. A
+`file.close` carries neither a path nor any payload flag.
+
+The frame timestamp is when the supervisor received the report. The payload's
+completion time is when the call finished inside the target. The two can differ,
+and under concurrency only the completion time orders operations as the target
+performed them.
+
+`runtime.operations_dropped` records that the bounded runtime channel lost
+reported operations, counted from gaps in the runtime's own sequence numbering.
+The supervisor appends it once, after the target's result, and only when the
+count is nonzero. Its absence means no loss was detected, not that the runtime
+observed every operation the target performed: a call the hooks never saw is not
+counted by anything.
 
 ## Planned event extensions
 
 Later process and signal work may add `process.fork` and `signal.inject`.
 
-File events, introduced with the C runtime:
+Remaining file events:
 
-- `file.open`, `file.close`, `file.read`, `file.write`
+- `file.read`, `file.write`
 
-Early file events store metadata such as path, descriptor, requested and actual
-byte counts, return value, `errno`, and duration—not file contents.
+They will store metadata such as requested and actual byte counts, return value,
+`errno`, and duration—not file contents.
 
 Socket events:
 
@@ -199,7 +258,15 @@ the redundant payload length and zero flags, and requires nondecreasing
 timestamps. It also enforces the v1.0 payload schemas: `process.start`,
 `process.exec`, and `runtime.handshake` are empty, stream chunks contain
 arbitrary bounded bytes, and exit, signal, launch-failure, and signal-receive
-payloads are exactly one little-endian `u32`.
+payloads are exactly one little-endian `u32`. A dropped-operation count is
+exactly one `u64`.
+
+File events are decoded through one shared routine that the writer also uses to
+check its own bytes, so the encoder cannot produce a payload its matching reader
+would reject. The stored path length is checked against both the 4096-byte bound
+and the actual payload size before it can address any byte, an undefined payload
+flag is rejected, and a `file.close` carrying a path or a flag is rejected as a
+disagreement about which operation the frame describes.
 Unknown event identifiers remain valid when their surrounding frame is valid;
 the reader exposes their type, thread ID, and opaque bounded payload without
 assigning semantics.

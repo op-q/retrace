@@ -439,6 +439,138 @@ void test_inspect_renders_safe_metadata_and_timeline(TestContext& test) {
               "inspect summarizes all complete events and structural validity");
 }
 
+void test_inspect_renders_file_operations(TestContext& test) {
+  TemporaryPath trace_path;
+  test.expect(!trace_path.value().empty(),
+              "a temporary file-operation trace path is available");
+  if (trace_path.value().empty()) {
+    return;
+  }
+
+  constexpr std::array target_arguments{std::string_view{"demo"}};
+  const retrace::trace::Metadata metadata{
+      .retrace_version = "unit",
+      .operating_system = "TestOS",
+      .architecture = "arch",
+      .working_directory = "/synthetic",
+      .arguments = target_arguments,
+  };
+
+  {
+    retrace::trace::Writer writer;
+    const auto creation =
+        retrace::trace::Writer::create(trace_path.value(), metadata, writer);
+    test.expect(!creation.error, "the file-operation trace is created");
+    if (creation.error) {
+      return;
+    }
+
+    // A path is target-controlled input, so this one carries an escape byte that
+    // must never reach the terminal raw.
+    const retrace::trace::FileEvent opened{
+        .completion_offset_nanoseconds = 1000U,
+        .duration_nanoseconds = 2000U,
+        .result = 3,
+        .error_number = 0U,
+        .descriptor = 3,
+        .directory = 0,
+        .open_flags = 0x241U,
+        .mode = 0600U,
+        .flags = 0U,
+        // Split so the compiler cannot fold the following 'c' into the escape.
+        .path = std::string_view{"/synthetic/es\x1b"
+                                 "cape.txt"},
+    };
+    const retrace::trace::FileEvent missing{
+        .completion_offset_nanoseconds = 3000U,
+        .duration_nanoseconds = 500U,
+        .result = -1,
+        .error_number = 2U,
+        .descriptor = -1,
+        .directory = 0,
+        .open_flags = 0U,
+        .mode = 0U,
+        .flags = retrace::trace::file_event_flag_path_truncated,
+        .path = std::string_view{"/synthetic/long"},
+    };
+    const retrace::trace::FileEvent relative{
+        .completion_offset_nanoseconds = 4000U,
+        .duration_nanoseconds = 600U,
+        .result = 4,
+        .error_number = 0U,
+        .descriptor = 4,
+        .directory = 3,
+        .open_flags = 0U,
+        .mode = 0U,
+        .flags = retrace::trace::file_event_flag_relative_to_directory,
+        .path = std::string_view{"observed.txt"},
+    };
+    const retrace::trace::FileEvent closed{
+        .completion_offset_nanoseconds = 5000U,
+        .duration_nanoseconds = 100U,
+        .result = -1,
+        .error_number = 9U,
+        .descriptor = -1,
+        .directory = 0,
+        .open_flags = 0U,
+        .mode = 0U,
+        .flags = 0U,
+        .path = {},
+    };
+
+    const auto start_error =
+        writer.write_event(retrace::trace::EventType::process_start, 42U);
+    const auto opened_error =
+        writer.write_file_event(retrace::trace::EventType::file_open, 42U, 77U, opened);
+    const auto missing_error = writer.write_file_event(
+        retrace::trace::EventType::file_open, 42U, 77U, missing);
+    const auto relative_error = writer.write_file_event(
+        retrace::trace::EventType::file_open, 42U, 77U, relative);
+    const auto closed_error = writer.write_file_event(
+        retrace::trace::EventType::file_close, 42U, 77U, closed);
+    const auto dropped_error = writer.write_dropped_operations_event(42U, 3U);
+    const auto exit_error =
+        writer.write_value_event(retrace::trace::EventType::process_exit, 42U, 0U);
+    test.expect(!start_error && !opened_error && !missing_error && !relative_error &&
+                    !closed_error && !dropped_error && !exit_error,
+                "the synthetic file-operation events are written");
+  }
+
+  const std::array arguments{std::string_view{"inspect"},
+                             std::string_view{trace_path.value()}};
+  std::ostringstream output;
+  std::ostringstream error;
+  const auto result = retrace::cli::run(arguments, output, error);
+  const auto rendered = output.str();
+
+  test.expect(result == static_cast<int>(retrace::cli::ExitCode::success),
+              "inspect accepts a trace containing file operations");
+  test.expect(rendered.find("file.open") != std::string::npos &&
+                  rendered.find("tid=77 fd=3 path=\"/synthetic/es\\x1bcape.txt\"") !=
+                      std::string::npos,
+              "inspect renders a successful open and escapes its path");
+  test.expect(rendered.find("open_flags=0x241 mode=0600") != std::string::npos,
+              "inspect renders open flags in hexadecimal and the mode in octal");
+  test.expect(
+      rendered.find("tid=77 errno=2 path=\"/synthetic/long\" (path truncated)") !=
+          std::string::npos,
+      "inspect reports a failed open and marks a truncated path");
+  test.expect(rendered.find("fd=4 dirfd=3 path=\"observed.txt\"") != std::string::npos,
+              "inspect names the directory an openat resolved against");
+  test.expect(rendered.find("file.close") != std::string::npos &&
+                  rendered.find("tid=77 fd=-1 errno=9") != std::string::npos,
+              "inspect reports a failed close with the descriptor it was given");
+  test.expect(
+      rendered.find("duration=0.002 ms completed=0.001 ms") != std::string::npos,
+      "inspect distinguishes the call duration from its completion time");
+  test.expect(rendered.find("runtime.operations_dropped") != std::string::npos &&
+                  rendered.find("count=3") != std::string::npos,
+              "inspect renders the dropped-operation event");
+  test.expect(rendered.find("dropped_operations=3 status=structurally-valid\n") !=
+                  std::string::npos,
+              "the summary reports that the recorded timeline is incomplete");
+}
+
 void test_validate_reports_a_normal_output_failure(TestContext& test) {
   TemporaryPath trace_path;
   test.expect(!trace_path.value().empty(),
@@ -701,8 +833,8 @@ void test_run_requires_a_target_after_separator(TestContext& test) {
               "run without a target returns a usage error");
   test.expect(output.str().empty(), "invalid run syntax has no normal output");
   test.expect(error.str() ==
-                  "usage: retrace run [--output TRACE] [--working-directory PATH] -- "
-                  "COMMAND [ARGS...]\n",
+                  "usage: retrace run [--output TRACE] [--working-directory PATH] "
+                  "[--no-runtime] -- COMMAND [ARGS...]\n",
               "invalid run syntax shows the exact command shape");
 }
 
@@ -718,6 +850,7 @@ void test_run_help_describes_implemented_behavior(TestContext& test) {
   test.expect(output.str().starts_with("Usage:\n  retrace run") &&
                   output.str().find("--output TRACE") != std::string::npos &&
                   output.str().find("--working-directory PATH") != std::string::npos &&
+                  output.str().find("--no-runtime") != std::string::npos &&
                   output.str().find("SIGINT and SIGTERM") != std::string::npos,
               "run help describes every implemented run control");
   test.expect(error.str().empty(), "run --help has no error output");
@@ -871,7 +1004,7 @@ void test_recording_reports_incomplete_trace_after_output_failure(TestContext& t
       "a finalized writer does not hide semantic trace incompleteness");
 }
 
-void test_run_records_a_runtime_handshake(TestContext& test) {
+void test_run_automatically_records_a_runtime_handshake(TestContext& test) {
   TemporaryPath trace_path;
   test.expect(!trace_path.value().empty(),
               "a temporary runtime-handshake trace path is available");
@@ -879,18 +1012,15 @@ void test_run_records_a_runtime_handshake(TestContext& test) {
     return;
   }
 
-  const std::array arguments{std::string_view{"run"},
-                             std::string_view{"--output"},
+  const std::array arguments{std::string_view{"run"}, std::string_view{"--output"},
                              std::string_view{trace_path.value()},
-                             std::string_view{"--"},
-                             std::string_view{RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH},
-                             std::string_view{"load-runtime"}};
+                             std::string_view{"--"}, std::string_view{"/bin/true"}};
   std::ostringstream output;
   std::ostringstream error;
   const auto result = retrace::cli::run(arguments, output, error);
 
   test.expect(result == static_cast<int>(retrace::cli::ExitCode::success),
-              "run succeeds when the target runtime handshakes");
+              "run succeeds when it automatically loads the target runtime");
   test.expect(output.str().empty() && error.str().empty(),
               "a runtime handshake does not contaminate target streams");
 
@@ -916,6 +1046,37 @@ void test_run_records_a_runtime_handshake(TestContext& test) {
               "a valid runtime handshake trace has no inspection diagnostic");
 }
 
+void test_run_can_disable_the_runtime(TestContext& test) {
+  TemporaryPath trace_path;
+  test.expect(!trace_path.value().empty(),
+              "a temporary no-runtime trace path is available");
+  if (trace_path.value().empty()) {
+    return;
+  }
+
+  const std::array arguments{
+      std::string_view{"run"},      std::string_view{"--no-runtime"},
+      std::string_view{"--output"}, std::string_view{trace_path.value()},
+      std::string_view{"--"},       std::string_view{"/bin/true"}};
+  std::ostringstream output;
+  std::ostringstream error;
+  const auto result = retrace::cli::run(arguments, output, error);
+
+  test.expect(result == static_cast<int>(retrace::cli::ExitCode::success),
+              "--no-runtime preserves an ordinary target result");
+  test.expect(output.str().empty() && error.str().empty(),
+              "disabling the runtime adds no target-stream output");
+
+  const auto frames = read_trace_frames(trace_path.value());
+  const auto handshake =
+      std::find_if(frames.begin(), frames.end(), [](const auto& frame) {
+        return frame.type ==
+               static_cast<std::uint16_t>(retrace::trace::EventType::runtime_handshake);
+      });
+  test.expect(handshake == frames.end(),
+              "--no-runtime records no false runtime handshake");
+}
+
 void test_run_writes_an_explicit_trace_without_overwriting(TestContext& test) {
   TemporaryPath trace_path;
   test.expect(!trace_path.value().empty(), "a temporary CLI trace path is available");
@@ -938,9 +1099,9 @@ void test_run_writes_an_explicit_trace_without_overwriting(TestContext& test) {
   test.expect(error.str().empty(), "a successful recording has no diagnostic");
 
   const auto frames = read_trace_frames(trace_path.value());
-  test.expect(frames.size() == 4U,
-              "recording writes start, exec, stdout, and exit frames");
-  if (frames.size() == 4U) {
+  test.expect(frames.size() == 5U,
+              "recording writes start, exec, runtime, stdout, and exit frames");
+  if (frames.size() == 5U) {
     test.expect(frames[0].type == static_cast<std::uint16_t>(
                                       retrace::trace::EventType::process_start),
                 "the recording starts with a process-start frame");
@@ -948,13 +1109,16 @@ void test_run_writes_an_explicit_trace_without_overwriting(TestContext& test) {
                     static_cast<std::uint16_t>(retrace::trace::EventType::process_exec),
                 "the recording confirms successful exec");
     test.expect(frames[2].type == static_cast<std::uint16_t>(
-                                      retrace::trace::EventType::standard_output) &&
-                    frames[2].payload == "recorded output",
-                "the recording stores the captured stdout bytes");
+                                      retrace::trace::EventType::runtime_handshake),
+                "the recording confirms automatic runtime loading");
     test.expect(frames[3].type == static_cast<std::uint16_t>(
+                                      retrace::trace::EventType::standard_output) &&
+                    frames[3].payload == "recorded output",
+                "the recording stores the captured stdout bytes");
+    test.expect(frames[4].type == static_cast<std::uint16_t>(
                                       retrace::trace::EventType::process_exit) &&
-                    frames[3].payload.size() == sizeof(std::uint32_t) &&
-                    static_cast<unsigned char>(frames[3].payload[0]) == 0U,
+                    frames[4].payload.size() == sizeof(std::uint32_t) &&
+                    static_cast<unsigned char>(frames[4].payload[0]) == 0U,
                 "the recording ends with exit status zero");
   }
 
@@ -987,6 +1151,7 @@ int main() {
   test_trace_commands_report_a_missing_file(test);
   test_validate_accepts_a_structurally_valid_trace(test);
   test_inspect_renders_safe_metadata_and_timeline(test);
+  test_inspect_renders_file_operations(test);
   test_validate_reports_a_normal_output_failure(test);
   test_inspect_reports_a_normal_output_failure(test);
   test_trace_commands_reject_a_malformed_header(test);
@@ -1002,7 +1167,8 @@ int main() {
   test_run_reports_a_missing_executable(test);
   test_run_routes_target_output(test);
   test_recording_reports_incomplete_trace_after_output_failure(test);
-  test_run_records_a_runtime_handshake(test);
+  test_run_automatically_records_a_runtime_handshake(test);
+  test_run_can_disable_the_runtime(test);
   test_run_writes_an_explicit_trace_without_overwriting(test);
   return test.result();
 }

@@ -209,6 +209,148 @@ void test_reads_known_and_unknown_events(TestContext& test) {
               "EOF remains terminal on subsequent reads");
 }
 
+// Builds a file-event payload independently of the encoder, so this test cannot
+// pass merely because both sides made the same mistake.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
+[[nodiscard]] std::vector<unsigned char> file_event_payload(
+    const std::int64_t result, const std::uint32_t error_number,
+    const std::uint32_t flags, const std::string_view path) {
+  std::vector<unsigned char> payload;
+  append_u64(payload, 111U);
+  append_u64(payload, 222U);
+  append_u64(payload, static_cast<std::uint64_t>(result));
+  append_u32(payload, error_number);
+  append_u32(payload, 3U);
+  append_u32(payload, 4U);
+  append_u32(payload, 0x241U);
+  append_u32(payload, 0600U);
+  append_u32(payload, flags);
+  append_u32(payload, static_cast<std::uint32_t>(path.size()));
+  payload.insert(payload.end(), path.begin(), path.end());
+  return payload;
+}
+// NOLINTEND(bugprone-easily-swappable-parameters)
+
+void expect_invalid_event(TestContext& test, const std::vector<unsigned char>& bytes,
+                          const std::string_view message) {
+  retrace::trace::Reader reader;
+  if (open_bytes(bytes, reader)) {
+    test.expect(false, message);
+    return;
+  }
+
+  retrace::trace::Event event;
+  const auto read = reader.next(event);
+  test.expect(read.status == retrace::trace::ReadStatus::error &&
+                  read.error == retrace::trace::make_error_code(
+                                    retrace::trace::TraceErrc::invalid_event),
+              message);
+}
+
+void test_reads_and_rejects_file_events(TestContext& test) {
+  constexpr std::string_view synthetic_path = "/synthetic/observed.txt";
+  constexpr auto open_type =
+      static_cast<std::uint16_t>(retrace::trace::EventType::file_open);
+  constexpr auto close_type =
+      static_cast<std::uint16_t>(retrace::trace::EventType::file_close);
+  constexpr auto dropped_type =
+      static_cast<std::uint16_t>(retrace::trace::EventType::runtime_operations_dropped);
+
+  {
+    auto bytes = golden_header();
+    append_frame(
+        bytes, open_type, 1U,
+        file_event_payload(-1, 2U, retrace::trace::file_event_flag_path_truncated,
+                           synthetic_path));
+    append_frame(bytes, close_type, 2U, file_event_payload(0, 0U, 0U, {}));
+    std::vector<unsigned char> dropped_payload;
+    append_u64(dropped_payload, 5U);
+    append_frame(bytes, dropped_type, 3U, dropped_payload);
+
+    retrace::trace::Reader reader;
+    test.expect(!open_bytes(bytes, reader), "the file-event golden trace opens");
+
+    retrace::trace::Event event;
+    auto read = reader.next(event);
+    retrace::trace::FileEvent file;
+    test.expect(read.status == retrace::trace::ReadStatus::event &&
+                    retrace::trace::decode_file_event(
+                        retrace::trace::EventType::file_open, event.payload, file),
+                "the reader accepts an independently encoded file-open event");
+    test.expect(file.result == -1 && file.error_number == 2U && file.descriptor == 3 &&
+                    file.directory == 4 && file.open_flags == 0x241U &&
+                    file.mode == 0600U,
+                "every file-open field decodes at its own offset");
+    test.expect(file.path == synthetic_path &&
+                    (file.flags & retrace::trace::file_event_flag_path_truncated) != 0U,
+                "the stored path and its truncation flag decode together");
+
+    read = reader.next(event);
+    test.expect(read.status == retrace::trace::ReadStatus::event &&
+                    retrace::trace::decode_file_event(
+                        retrace::trace::EventType::file_close, event.payload, file) &&
+                    file.path.empty(),
+                "the reader accepts a close event with no path");
+
+    read = reader.next(event);
+    test.expect(read.status == retrace::trace::ReadStatus::event &&
+                    event.payload.size() == sizeof(std::uint64_t),
+                "the reader accepts a 64-bit dropped-operation count");
+  }
+
+  {
+    auto payload = file_event_payload(0, 0U, 0U, synthetic_path);
+    payload.resize(retrace::trace::file_event_header_size - 1U);
+    auto bytes = golden_header();
+    append_frame(bytes, open_type, 1U, payload);
+    expect_invalid_event(test, bytes,
+                         "a payload shorter than the fixed header is rejected");
+  }
+
+  {
+    auto payload = file_event_payload(0, 0U, 0U, synthetic_path);
+    // A length that disagrees with the payload it describes is exactly the input
+    // that must never be trusted to address memory.
+    set_u32(payload, 48U, static_cast<std::uint32_t>(synthetic_path.size() + 1U));
+    auto bytes = golden_header();
+    append_frame(bytes, open_type, 1U, payload);
+    expect_invalid_event(test, bytes,
+                         "a path size larger than the payload is rejected");
+  }
+
+  {
+    auto payload = file_event_payload(0, 0U, 0U, synthetic_path);
+    set_u32(payload, 48U, retrace::trace::maximum_file_event_path_size + 1U);
+    auto bytes = golden_header();
+    append_frame(bytes, open_type, 1U, payload);
+    expect_invalid_event(test, bytes,
+                         "a path size above the recorded bound is rejected");
+  }
+
+  {
+    auto payload = file_event_payload(0, 0U, 0U, synthetic_path);
+    set_u32(payload, 44U, ~retrace::trace::file_event_defined_flags);
+    auto bytes = golden_header();
+    append_frame(bytes, open_type, 1U, payload);
+    expect_invalid_event(test, bytes, "an undefined payload flag is rejected");
+  }
+
+  {
+    auto bytes = golden_header();
+    append_frame(bytes, close_type, 1U, file_event_payload(0, 0U, 0U, synthetic_path));
+    expect_invalid_event(test, bytes, "a close carrying a path is rejected");
+  }
+
+  {
+    std::vector<unsigned char> dropped_payload;
+    append_u32(dropped_payload, 5U);
+    auto bytes = golden_header();
+    append_frame(bytes, dropped_type, 1U, dropped_payload);
+    expect_invalid_event(test, bytes,
+                         "a dropped-operation count of the wrong size is rejected");
+  }
+}
+
 void test_rejects_malformed_headers(TestContext& test) {
   const auto complete_header = golden_header();
   bool all_header_cuts_are_truncated = true;
@@ -472,6 +614,7 @@ void test_every_final_frame_cut_preserves_complete_prefix(TestContext& test) {
 int main() {
   TestContext test;
   test_reads_known_and_unknown_events(test);
+  test_reads_and_rejects_file_events(test);
   test_rejects_malformed_headers(test);
   test_distinguishes_truncation_and_malformed_frames(test);
   test_every_final_frame_cut_preserves_complete_prefix(test);

@@ -1,28 +1,32 @@
 # Security and privacy model
 
-RETRACE currently executes another program, relays its stdout and stderr through
-bounded in-memory chunks, can persist selected run data to an explicit trace
-path, and can inspect or structurally validate v1.0 trace files. It does not yet
-inject a shared library. Runtime injection handles another sensitive boundary,
-so its security properties remain requirements—not claims about the current
-build.
+RETRACE executes another program, automatically injects its small C runtime into
+supported dynamic targets, relays stdout and stderr through bounded in-memory
+chunks, can persist selected run data to an explicit trace path, and can inspect
+or structurally validate v1.0 trace files.
 
 ## Current behavior
 
 - The current `run` command does not require root.
 - RETRACE launches only the command supplied after `run --` and waits for it.
-- The target inherits the invoking environment and standard input, except that
-  every caller-provided `RETRACE_RUNTIME_EVENT_FD` entry is replaced with the
-  supervisor's intended endpoint; stdout and stderr are redirected to RETRACE
-  pipes.
+- The target inherits the invoking environment and standard input. By default,
+  RETRACE replaces every caller-provided `RETRACE_RUNTIME_EVENT_FD` entry with
+  its intended endpoint and prepends its canonical runtime path to
+  `LD_PRELOAD`; existing preload entries are retained afterward.
+- Runtime paths containing loader token separators are rejected before the
+  target starts because `LD_PRELOAD` provides no escaping for those paths.
+- `--no-runtime` removes the owned channel, leaves `LD_PRELOAD` unchanged, and
+  performs recorder-only supervision.
 - The target runs as the leader of a new process group. `SIGINT` and `SIGTERM`
   received during supervision are forwarded to that group.
 - `--working-directory PATH` is resolved and checked before trace creation; the
   child independently changes directory before replacing its process image.
 - RETRACE concurrently relays stdout and stderr without storing a complete copy.
-- `--output TRACE` records command arguments, working directory, lifecycle, and
-  stdout/stderr chunks. It does not record environment variables, file contents,
-  or network payloads.
+- `--output TRACE` records command arguments, working directory, lifecycle,
+  stdout/stderr chunks, and the file operations the injected runtime observed.
+  A recorded operation includes the path the target passed, which may itself be
+  sensitive. It does not record environment variables, file contents, or network
+  payloads.
 - A trace path requests mode `0600` (a restrictive umask may remove more
   permissions) and uses close-on-exec, exclusive creation, and no final-component
   symlink following. Existing paths are not overwritten, and the target is not
@@ -61,11 +65,24 @@ EOF therefore cannot prove that the original writer finished, that a suffix was
 not lost, that bytes were not modified, or that data is safe to disclose.
 
 The runtime handshake preserves `errno`, avoids allocation, and lets the target
-continue if its event channel fails. The supervisor bounds and validates each
-sequenced packet and rejects malformed protocol input. Before operation
-interposition ships, hooks must additionally prevent recursion and minimize
-allocation and locking. Runtime instrumentation will not offer container-grade
-isolation.
+continue if its event channel fails. It restores close-on-exec after the initial
+target load so an exec'd descendant cannot reuse the session channel for a
+duplicate handshake. The supervisor bounds and validates each sequenced packet
+and rejects malformed protocol input.
+
+Static binaries, secure-execution targets such as setuid programs, direct
+syscalls, and some language runtimes may bypass `LD_PRELOAD`. When a requested
+handshake is absent, RETRACE reports instrumentation as unavailable after
+observing the target result; the target may already have performed side effects.
+The interposition hooks use a thread-local recursion guard, allocate nothing,
+take no locks, and restore the caller's `errno`. They read a path only after the
+real call accepted the pointer, so a target that passed an unmapped address
+receives `EFAULT` rather than a fault the runtime introduced, and they fall back
+to the raw syscall when symbol resolution fails. A target that closes the channel
+descriptor stops being instrumented rather than having that close recorded,
+because the kernel reuses the lowest free descriptor and a later target open
+could otherwise receive protocol frames into its own file. Runtime
+instrumentation does not provide container-grade isolation.
 
 ## Repository secret policy
 

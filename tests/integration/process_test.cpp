@@ -34,6 +34,18 @@
 #error "RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH must name the runtime channel fixture"
 #endif
 
+#ifndef RETRACE_RUNTIME_LIBRARY_PATH
+#error "RETRACE_RUNTIME_LIBRARY_PATH must name the production runtime library"
+#endif
+
+#ifndef RETRACE_PRELOAD_FIXTURE_PATH
+#error "RETRACE_PRELOAD_FIXTURE_PATH must name the harmless preload fixture"
+#endif
+
+#ifndef RETRACE_FILE_FIXTURE_PATH
+#error "RETRACE_FILE_FIXTURE_PATH must name the file-operation fixture"
+#endif
+
 namespace {
 
 class TestContext {
@@ -75,35 +87,35 @@ class TemporaryDirectory final {
   std::string path_;
 };
 
-class ScopedRuntimeEnvironment final {
+class ScopedEnvironment final {
  public:
-  explicit ScopedRuntimeEnvironment(const std::string_view value) {
-    if (const char* const previous = ::getenv(RETRACE_RUNTIME_EVENT_FD_ENV);
-        previous != nullptr) {
+  ScopedEnvironment(const char* const name, const std::string_view value)
+      : name_{name} {
+    if (const char* const previous = ::getenv(name_.c_str()); previous != nullptr) {
       previous_value_ = previous;
     }
-    configured_ =
-        ::setenv(RETRACE_RUNTIME_EVENT_FD_ENV, std::string{value}.c_str(), 1) == 0;
+    configured_ = ::setenv(name_.c_str(), std::string{value}.c_str(), 1) == 0;
   }
 
-  ~ScopedRuntimeEnvironment() {
+  ~ScopedEnvironment() {
     if (!configured_) {
       return;
     }
     if (previous_value_) {
       [[maybe_unused]] const auto result =
-          ::setenv(RETRACE_RUNTIME_EVENT_FD_ENV, previous_value_->c_str(), 1);
+          ::setenv(name_.c_str(), previous_value_->c_str(), 1);
     } else {
-      [[maybe_unused]] const auto result = ::unsetenv(RETRACE_RUNTIME_EVENT_FD_ENV);
+      [[maybe_unused]] const auto result = ::unsetenv(name_.c_str());
     }
   }
 
-  ScopedRuntimeEnvironment(const ScopedRuntimeEnvironment&) = delete;
-  ScopedRuntimeEnvironment& operator=(const ScopedRuntimeEnvironment&) = delete;
+  ScopedEnvironment(const ScopedEnvironment&) = delete;
+  ScopedEnvironment& operator=(const ScopedEnvironment&) = delete;
 
   [[nodiscard]] bool configured() const noexcept { return configured_; }
 
  private:
+  std::string name_;
   std::optional<std::string> previous_value_;
   bool configured_ = false;
 };
@@ -113,6 +125,46 @@ struct ObservedEvent {
   int process_id;
   int value;
 };
+
+// Operations are delivered by borrowed pointer into one reused instance, so a
+// test that wants to inspect a whole run must copy each report as it arrives.
+struct ObservedOperation {
+  retrace::process::RuntimeOperationKind kind{};
+  std::uint64_t sequence = 0U;
+  std::uint64_t monotonic_nanoseconds = 0U;
+  std::uint64_t duration_nanoseconds = 0U;
+  std::uint32_t thread_id = 0U;
+  std::int64_t result = 0;
+  std::uint32_t error_number = 0U;
+  std::int32_t descriptor = 0;
+  std::int32_t directory = 0;
+  bool path_truncated = false;
+  std::string path;
+};
+
+[[nodiscard]] retrace::process::ProcessEventHandler collect_operations(
+    std::vector<ObservedOperation>& destination) {
+  return [&destination](const retrace::process::ProcessEvent& event) {
+    if (event.type == retrace::process::ProcessEventType::runtime_operation &&
+        event.operation != nullptr) {
+      const auto& operation = *event.operation;
+      destination.push_back({
+          .kind = operation.kind,
+          .sequence = operation.sequence,
+          .monotonic_nanoseconds = operation.monotonic_nanoseconds,
+          .duration_nanoseconds = operation.duration_nanoseconds,
+          .thread_id = operation.thread_id,
+          .result = operation.result,
+          .error_number = operation.error_number,
+          .descriptor = operation.descriptor,
+          .directory = operation.directory,
+          .path_truncated = operation.path_truncated,
+          .path = operation.path,
+      });
+    }
+    return std::error_code{};
+  };
+}
 
 struct CapturedOutput {
   std::string standard_output;
@@ -156,7 +208,8 @@ void test_embedded_nul_argument_is_rejected(TestContext& test) {
 }
 
 void test_runtime_handshake_is_received(TestContext& test) {
-  ScopedRuntimeEnvironment caller_environment{"caller-value-must-be-replaced"};
+  ScopedEnvironment caller_environment{RETRACE_RUNTIME_EVENT_FD_ENV,
+                                       "caller-value-must-be-replaced"};
   test.expect(caller_environment.configured(),
               "the runtime environment replacement test is configured");
   if (!caller_environment.configured()) {
@@ -197,6 +250,291 @@ void test_runtime_handshake_is_received(TestContext& test) {
               "the supervisor receives exactly one runtime handshake");
   test.expect(exec_position < handshake_position && handshake_position < exit_position,
               "the runtime handshake follows exec and precedes target exit");
+}
+
+void test_runtime_is_automatically_loaded(TestContext& test) {
+  constexpr std::array arguments{std::string_view{RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH},
+                                 std::string_view{"no-handshake"}};
+  std::vector<ObservedEvent> events;
+  const auto result = retrace::process::execute(
+      arguments,
+      [&events](const retrace::process::ProcessEvent& event) {
+        events.push_back(
+            {.type = event.type, .process_id = event.process_id, .value = event.value});
+        return std::error_code{};
+      },
+      {.runtime_library = RETRACE_RUNTIME_LIBRARY_PATH});
+
+  const auto handshake_count =
+      std::count_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == retrace::process::ProcessEventType::runtime_handshake;
+      });
+  test.expect(
+      result.state == retrace::process::ProcessState::exited && result.exit_code == 0,
+      "an injected runtime target exits normally");
+  test.expect(handshake_count == 1,
+              "LD_PRELOAD automatically produces one validated runtime handshake");
+}
+
+void test_exec_descendant_does_not_duplicate_the_handshake(TestContext& test) {
+  constexpr std::array arguments{std::string_view{"/bin/sh"}, std::string_view{"-c"},
+                                 std::string_view{"/bin/true"}};
+  std::size_t handshake_count = 0U;
+  const auto result = retrace::process::execute(
+      arguments,
+      [&handshake_count](const retrace::process::ProcessEvent& event) {
+        if (event.type == retrace::process::ProcessEventType::runtime_handshake) {
+          ++handshake_count;
+        }
+        return std::error_code{};
+      },
+      {.runtime_library = RETRACE_RUNTIME_LIBRARY_PATH});
+
+  test.expect(
+      result.state == retrace::process::ProcessState::exited && result.exit_code == 0,
+      "an exec'd descendant does not turn runtime loading into a protocol error");
+  test.expect(handshake_count == 1,
+              "close-on-exec confines the session handshake to the direct image");
+}
+
+void test_runtime_records_observed_file_operations(TestContext& test) {
+  TemporaryDirectory directory;
+  test.expect(!directory.value().empty(),
+              "a temporary directory for file operations is available");
+  if (directory.value().empty()) {
+    return;
+  }
+
+  const std::string observed_path = directory.value() + "/observed.txt";
+  const std::string missing_path = directory.value() + "/absent.txt";
+  const std::array arguments{std::string_view{RETRACE_FILE_FIXTURE_PATH},
+                             std::string_view{"operations"},
+                             std::string_view{directory.value()}};
+  std::vector<ObservedOperation> operations;
+  const auto result =
+      retrace::process::execute(arguments, collect_operations(operations),
+                                {.runtime_library = RETRACE_RUNTIME_LIBRARY_PATH});
+  // The fixture created this file, and TemporaryDirectory only removes an empty
+  // directory.
+  ::unlink(observed_path.c_str());
+
+  // The fixture checks every return value and errno itself, so a zero exit is
+  // evidence that interposition stayed transparent to the target.
+  test.expect(
+      result.state == retrace::process::ProcessState::exited && result.exit_code == 0,
+      "an instrumented target still observes its own results and errno");
+  test.expect(result.dropped_runtime_operations == 0U,
+              "a short operation sequence is reported without loss");
+
+  const auto find = [&operations](const auto& predicate) {
+    return std::find_if(operations.begin(), operations.end(), predicate);
+  };
+  const auto successful_open = find([&observed_path](const ObservedOperation& value) {
+    return value.kind == retrace::process::RuntimeOperationKind::file_open &&
+           value.path == observed_path && value.result >= 0;
+  });
+  const auto failed_open = find([&missing_path](const ObservedOperation& value) {
+    return value.kind == retrace::process::RuntimeOperationKind::file_open &&
+           value.path == missing_path;
+  });
+  const auto relative_open = find([](const ObservedOperation& value) {
+    return value.kind == retrace::process::RuntimeOperationKind::file_openat &&
+           value.path == "observed.txt";
+  });
+  const auto truncated_open = find([](const ObservedOperation& value) {
+    return value.kind == retrace::process::RuntimeOperationKind::file_open &&
+           value.path_truncated;
+  });
+  const auto failed_close = find([](const ObservedOperation& value) {
+    return value.kind == retrace::process::RuntimeOperationKind::file_close &&
+           value.descriptor == -1;
+  });
+  const auto successful_close = find([](const ObservedOperation& value) {
+    return value.kind == retrace::process::RuntimeOperationKind::file_close &&
+           value.result == 0;
+  });
+
+  test.expect(successful_open != operations.end(),
+              "a successful open is reported with the path the target passed");
+  if (successful_open != operations.end()) {
+    test.expect(successful_open->descriptor == successful_open->result &&
+                    successful_open->error_number == 0U,
+                "a successful open reports its descriptor and no error number");
+    test.expect(successful_open->monotonic_nanoseconds > 0U,
+                "a reported operation carries a monotonic completion time");
+  }
+
+  test.expect(failed_open != operations.end(),
+              "an open that failed is reported rather than omitted");
+  if (failed_open != operations.end()) {
+    test.expect(failed_open->result == -1 &&
+                    failed_open->error_number == static_cast<std::uint32_t>(ENOENT),
+                "a failed open preserves the kernel's own error number");
+  }
+
+  test.expect(relative_open != operations.end(),
+              "openat is reported separately from open");
+  if (relative_open != operations.end()) {
+    test.expect(relative_open->directory >= 0 && relative_open->result >= 0,
+                "openat reports the directory descriptor it resolved against");
+  }
+
+  // The runtime stores a bounded prefix and marks it, so an oversized path
+  // cannot be mistaken for the argument the target actually passed.
+  test.expect(truncated_open != operations.end(),
+              "an oversized path is still reported as an attempt");
+  if (truncated_open != operations.end()) {
+    test.expect(truncated_open->path.size() == RETRACE_RUNTIME_FILE_MAX_PATH_SIZE,
+                "a truncated path is stored at exactly the recorded bound");
+    test.expect(
+        truncated_open->error_number == static_cast<std::uint32_t>(ENAMETOOLONG),
+        "an oversized path reports the kernel's rejection");
+  }
+
+  test.expect(successful_close != operations.end(), "a successful close is reported");
+  test.expect(failed_close != operations.end(),
+              "a close of an invalid descriptor is reported");
+  if (failed_close != operations.end()) {
+    test.expect(failed_close->error_number == static_cast<std::uint32_t>(EBADF) &&
+                    failed_close->path.empty(),
+                "a failed close reports EBADF and carries no path");
+  }
+
+  const auto single_threaded = std::all_of(
+      operations.begin(), operations.end(), [&result](const ObservedOperation& value) {
+        return value.thread_id == static_cast<std::uint32_t>(result.process_id);
+      });
+  test.expect(single_threaded,
+              "a single-threaded target reports its main thread identifier");
+}
+
+void test_concurrent_file_operations_are_attributed_to_threads(TestContext& test) {
+  TemporaryDirectory directory;
+  test.expect(!directory.value().empty(),
+              "a temporary directory for concurrent operations is available");
+  if (directory.value().empty()) {
+    return;
+  }
+
+  const std::string observed_path = directory.value() + "/observed.txt";
+  const std::array arguments{std::string_view{RETRACE_FILE_FIXTURE_PATH},
+                             std::string_view{"threads"},
+                             std::string_view{directory.value()}};
+  std::vector<ObservedOperation> operations;
+  const auto result =
+      retrace::process::execute(arguments, collect_operations(operations),
+                                {.runtime_library = RETRACE_RUNTIME_LIBRARY_PATH});
+  ::unlink(observed_path.c_str());
+
+  test.expect(
+      result.state == retrace::process::ProcessState::exited && result.exit_code == 0,
+      "concurrent interposed calls return each thread's own result");
+
+  std::vector<std::uint32_t> thread_ids;
+  std::vector<std::uint64_t> sequences;
+  thread_ids.reserve(operations.size());
+  sequences.reserve(operations.size());
+  for (const auto& operation : operations) {
+    thread_ids.push_back(operation.thread_id);
+    sequences.push_back(operation.sequence);
+  }
+  std::sort(thread_ids.begin(), thread_ids.end());
+  thread_ids.erase(std::unique(thread_ids.begin(), thread_ids.end()), thread_ids.end());
+  std::sort(sequences.begin(), sequences.end());
+  const auto duplicate = std::adjacent_find(sequences.begin(), sequences.end());
+
+  test.expect(
+      thread_ids.size() > 1U,
+      "operations from several target threads keep distinct thread identifiers");
+  test.expect(duplicate == sequences.end(),
+              "each reported operation carries its own sequence number");
+
+  // The runtime numbers every attempt, so the highest number seen accounts for
+  // exactly the packets that arrived plus the ones the bounded channel dropped.
+  // This holds under reordering, which a running "expected next" counter would
+  // misreport as loss.
+  if (!sequences.empty()) {
+    test.expect(sequences.back() + 1U == static_cast<std::uint64_t>(sequences.size()) +
+                                             result.dropped_runtime_operations,
+                "sequence accounting explains every attempted report");
+  }
+}
+
+void test_runtime_preload_preserves_the_caller_value(TestContext& test) {
+  ScopedEnvironment caller_preload{"LD_PRELOAD", RETRACE_PRELOAD_FIXTURE_PATH};
+  test.expect(caller_preload.configured(),
+              "the caller preload preservation test is configured");
+  if (!caller_preload.configured()) {
+    return;
+  }
+
+  const std::string expected_preload =
+      std::string{RETRACE_RUNTIME_LIBRARY_PATH} + ':' + RETRACE_PRELOAD_FIXTURE_PATH;
+  const std::array arguments{std::string_view{RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH},
+                             std::string_view{"expect-preload"},
+                             std::string_view{expected_preload}};
+  const auto result = retrace::process::execute(
+      arguments, {}, {.runtime_library = RETRACE_RUNTIME_LIBRARY_PATH});
+
+  test.expect(
+      result.state == retrace::process::ProcessState::exited && result.exit_code == 0,
+      "runtime injection prepends RETRACE and preserves the caller's preload");
+}
+
+void test_missing_required_runtime_is_reported(TestContext& test) {
+  constexpr std::array arguments{std::string_view{"/bin/true"}};
+  std::vector<ObservedEvent> events;
+  const auto result = retrace::process::execute(
+      arguments,
+      [&events](const retrace::process::ProcessEvent& event) {
+        events.push_back(
+            {.type = event.type, .process_id = event.process_id, .value = event.value});
+        return std::error_code{};
+      },
+      {.runtime_library = RETRACE_PRELOAD_FIXTURE_PATH});
+
+  const auto exit_event =
+      std::find_if(events.begin(), events.end(), [](const auto& event) {
+        return event.type == retrace::process::ProcessEventType::exited;
+      });
+  test.expect(result.state == retrace::process::ProcessState::runtime_unavailable,
+              "a target without the required handshake is explicitly unsupported");
+  test.expect(result.exit_code == 0 &&
+                  result.error == std::make_error_code(std::errc::not_supported),
+              "runtime unavailability preserves the observed target result");
+  test.expect(exit_event != events.end(),
+              "runtime unavailability does not discard target lifecycle evidence");
+}
+
+void test_runtime_channel_can_be_disabled(TestContext& test) {
+  ScopedEnvironment caller_environment{RETRACE_RUNTIME_EVENT_FD_ENV,
+                                       "caller-value-must-be-removed"};
+  test.expect(caller_environment.configured(),
+              "the disabled runtime channel test is configured");
+  if (!caller_environment.configured()) {
+    return;
+  }
+
+  constexpr std::array arguments{std::string_view{RETRACE_RUNTIME_CHANNEL_FIXTURE_PATH},
+                                 std::string_view{"no-channel"}};
+  const auto result =
+      retrace::process::execute(arguments, {}, {.runtime_channel_enabled = false});
+
+  test.expect(
+      result.state == retrace::process::ProcessState::exited && result.exit_code == 0,
+      "disabling the runtime removes the owned channel from the target");
+}
+
+void test_invalid_runtime_library_is_rejected(TestContext& test) {
+  constexpr std::array arguments{std::string_view{"/bin/true"}};
+  const auto result = retrace::process::execute(
+      arguments, {}, {.runtime_library = "/tmp/not:a-library.so"});
+
+  test.expect(result.state == retrace::process::ProcessState::supervisor_failed,
+              "an unrepresentable preload path is rejected");
+  test.expect(result.process_id == 0 &&
+                  result.error == std::make_error_code(std::errc::invalid_argument),
+              "invalid preload bytes are rejected before fork");
 }
 
 void test_absent_runtime_handshake_is_nonfatal(TestContext& test) {
@@ -682,6 +1020,14 @@ int main() {
   test_empty_command_is_rejected(test);
   test_embedded_nul_argument_is_rejected(test);
   test_runtime_handshake_is_received(test);
+  test_runtime_is_automatically_loaded(test);
+  test_runtime_records_observed_file_operations(test);
+  test_concurrent_file_operations_are_attributed_to_threads(test);
+  test_exec_descendant_does_not_duplicate_the_handshake(test);
+  test_runtime_preload_preserves_the_caller_value(test);
+  test_missing_required_runtime_is_reported(test);
+  test_runtime_channel_can_be_disabled(test);
+  test_invalid_runtime_library_is_rejected(test);
   test_absent_runtime_handshake_is_nonfatal(test);
   test_invalid_runtime_messages_are_rejected(test);
   test_clean_exit(test);

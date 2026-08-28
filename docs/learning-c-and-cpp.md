@@ -296,6 +296,35 @@ duplicate packets. Once the direct target exits, it drains only immediately
 available messages and closes the channel so a descendant cannot keep
 supervision alive indefinitely.
 
+## Lesson 14: loading a guest library deliberately
+
+`LD_PRELOAD` asks the Linux dynamic loader to place a shared library before the
+target's ordinary dependencies. RETRACE resolves its own executable through
+`/proc/self/exe`, selects the exact build runtime or the installed relative
+library directory, and passes an absolute canonical path. The environment is
+rebuilt before `fork()` so the child can stay allocation-free: RETRACE's path is
+prepended, caller preload entries remain afterward, and the owned channel entry
+is replaced rather than trusted.
+
+The descriptor needs opposite close-on-exec states at two moments. The
+supervisor first clears `FD_CLOEXEC` so the runtime can receive it during the
+target's initial `execvpe()`. The runtime constructor restores `FD_CLOEXEC`
+after loading. Hooks can continue using the open descriptor in that process
+image, while a later exec cannot accidentally produce a second session
+handshake through an inherited endpoint.
+
+Static and secure-execution targets may ignore `LD_PRELOAD`. That is not an
+`execvpe()` failure: the target can run successfully without instrumentation.
+The supervisor therefore observes and records the final target result, then
+classifies the missing required handshake separately. `--no-runtime` makes the
+recorder-only choice explicit.
+
+Sanitizers add another loader-order constraint. A sanitizer-instrumented preload
+cannot safely enter an arbitrary uninstrumented program because its sanitizer
+runtime may be initialized too late. RETRACE keeps the production preload
+ordinary and builds a second instrumented copy only for sanitizer-enabled C
+tests.
+
 ## Habits to practice now
 
 - Read compiler warnings; do not merely silence them.

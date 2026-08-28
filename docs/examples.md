@@ -17,9 +17,9 @@ The normal example writes one line to each stream and exits with status zero:
 ./build/dev/bin/retrace validate /tmp/retrace-normal.rtc
 ```
 
-The trace contains start and exec events, separate stdout and stderr chunks, and
-a final `process.exit` event. The selected `/tmp` directory is stored in the
-trace header.
+The trace contains start, exec, and `runtime.handshake` events, separate stdout
+and stderr chunks, and a final `process.exit` event. The selected `/tmp`
+directory is stored in the trace header.
 
 ## Intentional crash
 
@@ -37,5 +37,6 @@ printf 'run status: %s\n' "$status"
 ```
 
 On Linux, the wrapper reports signal 11 and returns shell-style status 139. The
-trace ends with `process.signal signal=11`. Trace files can contain sensitive
-arguments and output; review and remove these `/tmp` examples when finished.
+trace includes the runtime handshake and ends with `process.signal signal=11`.
+Trace files can contain sensitive arguments and output; review and remove these
+`/tmp` examples when finished.

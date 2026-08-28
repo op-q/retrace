@@ -36,3 +36,6 @@ secrets.json
 core
 core.*
 *.core
+
+# Rendered trace timelines carry the same process data as the traces
+/logs/

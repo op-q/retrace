@@ -31,7 +31,58 @@ enum class EventType : std::uint16_t {  // NOLINT(performance-enum-size)
   process_launch_failure = 7U,
   signal_receive = 8U,
   runtime_handshake = 9U,
+  file_open = 10U,
+  file_close = 11U,
+  runtime_operations_dropped = 12U,
 };
+
+// File-event payload limits. The path bound matches the runtime's own limit, so
+// a path the runtime already truncated is never truncated a second time here.
+inline constexpr std::uint32_t maximum_file_event_path_size = 4096U;
+inline constexpr std::uint32_t file_event_header_size = 52U;
+
+// Payload flags are scoped to one file event and are unrelated to the frame
+// header's flags field, which stays zero in v1.0. A reader rejects any bit
+// outside the defined mask so a later addition cannot be silently misread.
+inline constexpr std::uint32_t file_event_flag_path_truncated = 0x1U;
+inline constexpr std::uint32_t file_event_flag_relative_to_directory = 0x2U;
+inline constexpr std::uint32_t file_event_defined_flags =
+    file_event_flag_path_truncated | file_event_flag_relative_to_directory;
+
+// Decoded payload of a `file.open` or `file.close` event. Only the members
+// meaningful for the event type carry information; the rest stay zero, so a
+// consumer never has to guess which field a given event populated.
+//
+// The frame's process and thread identifiers are deliberately not members: they
+// live in the event frame header, and mixing frame fields into a payload struct
+// would let a caller populate one and silently lose the other.
+struct FileEvent {
+  // Completion time observed inside the target, as an offset from the header's
+  // monotonic base. It is not the frame timestamp, which records when the
+  // supervisor received the report; under concurrency the two can disagree.
+  std::uint64_t completion_offset_nanoseconds = 0U;
+  std::uint64_t duration_nanoseconds = 0U;
+  // The value the interposed call returned. `error_number` is meaningful only
+  // when this is negative.
+  std::int64_t result = 0;
+  std::uint32_t error_number = 0U;
+  // A successful open result, or the argument of a close.
+  std::int32_t descriptor = 0;
+  // Meaningful only with `file_event_flag_relative_to_directory`.
+  std::int32_t directory = 0;
+  std::uint32_t open_flags = 0U;
+  std::uint32_t mode = 0U;
+  std::uint32_t flags = 0U;
+  // Borrowed from the payload passed to decode_file_event, and empty for a
+  // close. Bytes are stored without a terminator and need not be valid UTF-8.
+  std::string_view path;
+};
+
+// Decodes and fully validates one file-event payload. Returning false means the
+// bytes are not a valid v1.0 file event; `result` is then unspecified. The
+// returned path borrows from `payload`, which must outlive every use of it.
+[[nodiscard]] bool decode_file_event(EventType type, std::string_view payload,
+                                     FileEvent& result);
 
 struct Metadata {
   // Views are consumed synchronously by Writer::create and need not outlive it.
@@ -119,6 +170,21 @@ class Writer final {
   [[nodiscard]] std::error_code write_value_event(EventType type,
                                                   std::uint32_t process_id,
                                                   std::uint32_t value);
+  // `type` must be file_open or file_close. The thread identifier belongs to
+  // the target thread that made the call and is stored in the frame header.
+  [[nodiscard]] std::error_code write_file_event(EventType type,
+                                                 std::uint32_t process_id,
+                                                 std::uint32_t thread_id,
+                                                 const FileEvent& fields);
+  // Records that the bounded runtime channel lost `count` reported operations,
+  // so a reader can tell an incomplete record from a complete one.
+  [[nodiscard]] std::error_code write_dropped_operations_event(std::uint32_t process_id,
+                                                               std::uint64_t count);
+  // Converts an absolute CLOCK_MONOTONIC reading, such as the completion time a
+  // runtime reported, into the offset this trace stores. A reading older than
+  // the header's base saturates at zero rather than wrapping.
+  [[nodiscard]] std::uint64_t offset_from_monotonic(
+      std::uint64_t monotonic_nanoseconds) const noexcept;
   // Closes the file and reports a final close(2) error. This is idempotent and
   // does not promise fsync(2)-level durability.
   [[nodiscard]] std::error_code finish() noexcept;
@@ -126,6 +192,11 @@ class Writer final {
   [[nodiscard]] bool is_open() const noexcept { return descriptor_ >= 0; }
 
  private:
+  // Single funnel for every frame: schema validation, timestamping, and the
+  // header/payload write pair happen in exactly one place.
+  [[nodiscard]] std::error_code write_frame(EventType type, std::uint32_t process_id,
+                                            std::uint32_t thread_id,
+                                            std::string_view payload);
   void close() noexcept;
 
   int descriptor_ = -1;
